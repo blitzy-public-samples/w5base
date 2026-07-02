@@ -235,7 +235,33 @@ log "database/user provisioned via modern CREATE USER/GRANT"
 cd "$W5BASEINSTDIR"
 log "running TableVersionCheck (schema build) ..."
 "$W5BASEINSTDIR/sbin/W5Event" -c "$W5APP_CONFIG" -s -d -v TableVersionCheck
-log "schema build complete"
+
+# Defense-in-depth: W5Event runs the schema build in serverless mode and returns
+# exit 0 even when the build FAILED internally (e.g. the database rejected the
+# legacy schema under a strict sql_mode). Because that failure is invisible to
+# `set -e`, the container would otherwise proceed to start Apache against an EMPTY
+# database and appear "up" while every request fails. Verify the build actually
+# produced tables and fail loudly (rather than silently) if it did not. This is a
+# READ-ONLY probe against the schema we just built; it changes nothing.
+#   * MYSQL_PWD keeps the root password out of the process list (as in step 4).
+#   * DB_NAME was validated to a strict identifier charset in step 1b, so its
+#     interpolation into the query string literal is safe (no injection, CWE-89).
+#   * `|| true` + integer sanitization keep a transient probe hiccup from aborting
+#     under `set -o pipefail`; only a definitive count of 0 is treated as failure,
+#     so a partially-built schema still passes (this guard targets exactly the
+#     "zero tables" silent-failure class, without over-constraining).
+schema_tables="$(MYSQL_PWD="$DB_ROOT_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u root -N -B \
+  -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}'" 2>/dev/null || true)"
+case "$schema_tables" in
+  ''|*[!0-9]*) schema_tables=0 ;;
+esac
+if [ "$schema_tables" -eq 0 ]; then
+  die "schema build produced 0 tables in database '${DB_NAME}': TableVersionCheck failed silently. \
+The database most likely rejected the legacy W5Base schema under a strict sql_mode - ensure \
+docker/mysql/my.cnf sets sql_mode=\"\" (see README.txt gotchas), then recreate the db service on a \
+fresh volume: docker compose down -v && docker compose up -d --build."
+fi
+log "schema build complete ($schema_tables tables present)"
 
 ########################################################################
 # 6. Start the persistent W5Server control plane (daemonizes, self-drops

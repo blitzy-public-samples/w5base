@@ -1,0 +1,31 @@
+# =============================================================================
+# .gitignore — protect local developer SECRETS from being committed.
+# -----------------------------------------------------------------------------
+# WHAT: Ignores the local environment file `.env` (and its common local
+#       variants) while keeping the committed placeholder template `.env.example`
+#       tracked.
+#
+# WHY:  The containerized dev environment reads real credentials
+#       (W5BASE_DB_PASSWORD, MYSQL_ROOT_PASSWORD, W5BASE_ADMIN_PASSWORD, ...) from
+#       `.env`, which docker-compose.yml loads via `env_file:`. Committing `.env`
+#       would leak those secrets into version control — exactly the posture the
+#       plan forbids ("Never hardcode secrets"; keep real secrets in `.env`,
+#       which must NEVER be committed). `.env.example` itself instructs adding
+#       `.env` to .gitignore; this file fulfils that instruction so a developer
+#       who copies `.env.example` to `.env` and fills in real values has a guard
+#       against an accidental `git add .`.
+#
+# HOW:  Git ignores the patterns below. The `.env.example` (and `.env.sample`)
+#       template stays tracked via the explicit negation entries, so onboarding
+#       docs and `cp .env.example .env` continue to work.
+# =============================================================================
+
+# Local environment file holding REAL secrets — never commit.
+.env
+# Common local override variants developers create — also never commit.
+.env.local
+.env.*.local
+
+# Keep the committed, secret-free templates tracked (must NOT be ignored).
+!.env.example
+!.env.sample
