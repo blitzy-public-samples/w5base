@@ -11,7 +11,10 @@
 #   2. docker compose up --build    # builds the app image and starts the stack
 #
 # WHAT COMES UP
-#   * db      — MySQL 8.0 (pinned) holding the `w5base` schema and app DB user.
+#   * db      — MariaDB 10.11 (pinned) holding the `w5base` schema and app DB
+#               user. MariaDB is required because the legacy W5Base schema uses
+#               MySQL-8 reserved words (e.g. `system`) as unquoted table names,
+#               which MySQL 8.0 rejects; MariaDB does not reserve them.
 #   * w5base  — Debian 12 + Apache (prefork MPM) + mod_perl2, built from the
 #               local Dockerfile. Its entrypoint (docker/entrypoint.sh) renders
 #               /etc/w5base/*.conf from .env, provisions the DB with modern
@@ -32,9 +35,10 @@
 #     for the DB to be *healthy* (ready), not merely *started*. This is the
 #     single most important reliability control — without it the entrypoint's
 #     TableVersionCheck races an uninitialized database and fails intermittently.
-#   * Pinned image tags (mysql:8.0 here; the local Dockerfile pins debian:12) for
-#     reproducibility — explicit tags are used instead of a floating `latest`
-#     tag so the environment stays deterministic across rebuilds.
+#   * Pinned image tags (mariadb:10.11 here; the local Dockerfile pins
+#     debian:12) for reproducibility — explicit tags are used instead of a
+#     floating `latest` tag so the environment stays deterministic across
+#     rebuilds.
 #   * NO hardcoded secrets (AAP §0.7): every credential is supplied at runtime
 #     from `.env` via `env_file:` (the mechanism .env.example itself prescribes).
 #     Env references inside the healthcheck shell are escaped as `$$VAR` so
@@ -55,15 +59,33 @@ services:
   # .env, which sets host=db, NOT localhost). docker/entrypoint.sh also derives
   # DB_HOST=db from that DSN. Renaming this service REQUIRES updating W5BASE_DSN.
   #
-  # WHY mysql:8.0 (pinned, never :latest): a reproducible, canonical environment
-  # (AAP §0.3.1). MariaDB 10.4+ (also pinned, e.g. `mariadb:10.11`) is a fully
-  # supported alternative and is what the base environment was validated against;
-  # both images ship the `mysqladmin` client the healthcheck uses (on MariaDB it
-  # is a symlink to `mariadb-admin`). No `command:` auth-plugin override is set,
-  # so this file stays portable across both engines: Debian 12's DBD::mysql
-  # (libmariadb3) authenticates fine against mysql:8.0's default plugin.
+  # WHY mariadb:10.11 (pinned, never :latest): a reproducible, canonical
+  # environment (AAP §0.3.1), and — critically — the ONLY engine the legacy
+  # W5Base schema loads cleanly under.
+  #
+  #   The schema under sql/** (READ-ONLY, must never be edited — AAP §0.6.2,
+  #   Preserve Backward Compatibility) creates tables whose names collide with
+  #   words MySQL 8.0 promoted to RESERVED keywords — e.g. sql/itil/itinv.sql
+  #   does `create table system (...)` UNQUOTED. MySQL 8.0 rejects that with a
+  #   1064 syntax error, so `sbin/W5Event ... TableVersionCheck` aborts partway
+  #   through itinv.sql and builds only ~95 of ~194 tables — leaving the app
+  #   deadlocked on the "Table Version Control" page. MariaDB does NOT reserve
+  #   SYSTEM (nor the other words the schema uses unquoted, e.g. GROUPS), so the
+  #   identical schema builds in full. MariaDB 10.11 is what the base
+  #   environment was validated against, and relaxing sql_mode in
+  #   docker/mysql/my.cnf cannot help here — reserved-word parsing is not
+  #   governed by sql_mode. Switching the engine is the correct, in-scope,
+  #   backward-compatible fix (no application/schema edits).
+  #
+  # PORTABILITY: MariaDB honors the same MYSQL_* first-boot env vars this file
+  # supplies (MYSQL_ROOT_PASSWORD / MYSQL_DATABASE / MYSQL_USER / MYSQL_PASSWORD),
+  # ships the `mysqladmin` client the healthcheck uses (a symlink to
+  # `mariadb-admin`), and auto-includes /etc/mysql/conf.d/*.cnf (so the my.cnf
+  # tuning below applies). Debian 12's DBD::mysql (libmariadb3) authenticates
+  # against MariaDB's default plugin, and no `command:` auth-plugin override is
+  # needed.
   db:
-    image: mysql:8.0
+    image: mariadb:10.11
 
     # All DB names/credentials come from .env (never hardcoded). On first start
     # the official image consumes MYSQL_ROOT_PASSWORD / MYSQL_DATABASE (=w5base)
@@ -160,12 +182,29 @@ services:
     ports:
       - "8080:80"
 
-    # Restart during development unless explicitly stopped. NOTE: this single
-    # container runs BOTH the persistent sbin/W5Server control plane AND Apache —
-    # the entrypoint starts W5Server, then exec's Apache as the main process — so
-    # Compose only needs to publish the HTTP port above. Application-level health
-    # (menu renders, W5InstallCheck, TableVersionCheck) is asserted by
-    # tests/smoke/w5base_smoke_test.sh rather than by a Compose healthcheck.
+    # CONTROL-PLANE HEALTHCHECK (AAP §0.7 Reliability). This single container
+    # runs BOTH the persistent sbin/W5Server control plane AND Apache — the
+    # entrypoint starts W5Server, then exec's Apache as the container's main
+    # process. Because Apache is the main process, Compose would report the
+    # container "Up" even if W5Server had silently died — and a dead W5Server is
+    # exactly the failure mode that leaves the app showing "W5Server is not
+    # available". W5Server listens on TCP 12833 (bound to the IPv4 loopback; see
+    # docker/w5base/w5server.conf.tmpl), so this healthcheck opens a TCP
+    # connection to 127.0.0.1:12833 from inside the container and marks it
+    # UNHEALTHY if the control plane is not listening. `bash` is used explicitly
+    # because the /dev/tcp pseudo-device is a bash feature (not available under
+    # /bin/sh). No secrets are involved. start_period is generous: the entrypoint
+    # builds the schema (TableVersionCheck) and starts W5Server before Apache, so
+    # 12833 only opens well into startup. (The entrypoint additionally fail-fasts
+    # if W5Server does not bind, so this is defence-in-depth + ongoing liveness.)
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/12833"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+    # Restart during development unless explicitly stopped.
     restart: unless-stopped
 
 # =============================================================================

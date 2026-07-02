@@ -234,7 +234,114 @@ log "database/user provisioned via modern CREATE USER/GRANT"
 ########################################################################
 cd "$W5BASEINSTDIR"
 log "running TableVersionCheck (schema build) ..."
-"$W5BASEINSTDIR/sbin/W5Event" -c "$W5APP_CONFIG" -s -d -v TableVersionCheck
+# Capture the schema-build output so it can be scanned for SQL errors while
+# still streaming it to the container log. W5Event runs the build in serverless
+# mode and returns exit 0 EVEN WHEN individual DDL statements were rejected by
+# the database (see the "tables > 0" note further below), so a bare invocation
+# would let a partially-built schema pass unnoticed. `|| true` keeps a non-zero
+# pipe status from aborting under `set -e`/`pipefail`; the explicit checks below
+# decide pass/fail.
+TVC_LOG="$(mktemp)"
+"$W5BASEINSTDIR/sbin/W5Event" -c "$W5APP_CONFIG" -s -d -v TableVersionCheck 2>&1 | tee "$TVC_LOG" >&2 || true
+
+# FAIL FAST on a schema-build SQL SYNTAX error. The definitive signature of the
+# reserved-word failure class (e.g. MySQL 8 rejecting the legacy unquoted
+# `create table system`) is the database's "error in your SQL syntax" message,
+# which W5Event echoes. Such an error aborts the offending SQL file mid-way and
+# cascades (dependent files never process), leaving the schema INCOMPLETE. It is
+# a hard, non-recoverable failure (unlike a transient ordering issue, which
+# surfaces as "table ... doesn't exist" and is intentionally NOT matched here),
+# so we stop rather than start Apache against half a schema. This closes the QA
+# "silent-failure masking" gap: W5Event's exit 0 no longer hides a broken build.
+if grep -Eq 'error in your SQL syntax' "$TVC_LOG"; then
+  log "TableVersionCheck emitted SQL syntax error(s) (first matches):"
+  grep -nE 'error in your SQL syntax|ERROR: Line [0-9]+ in file' "$TVC_LOG" | head -n 20 >&2 || true
+  rm -f "$TVC_LOG"
+  die "schema build FAILED: TableVersionCheck reported SQL syntax error(s), so the \
+schema is incomplete. This is the classic reserved-word collision - the database \
+engine rejected part of the legacy W5Base schema (e.g. an unquoted 'system' table \
+under MySQL 8). Use the MariaDB engine pinned in docker-compose.yml (db.image: \
+mariadb:10.11), then recreate on a fresh volume: docker compose down -v && docker \
+compose up -d --build."
+fi
+rm -f "$TVC_LOG"
+
+# ----------------------------------------------------------------------------
+# Reconcile the KNOWN cross-file schema ORDERING defect (in-scope; no sql/ edit).
+#
+#   sql/itil/itinv.sql, near its end (line 1857), runs
+#       alter table autodiscrec add key ...
+#   but the `autodiscrec` table is CREATEd by a DIFFERENT file,
+#   sql/itil/itinvautodisc.sql. TableVersionCheck orders files by an optional
+#   `# DEPEND <file>` directive on each file's `use <db>;` line (see the DEPEND
+#   parser in mod/base/menu.pm) and otherwise by glob order. sql/itil/itinv.sql
+#   is MISSING a `# DEPEND itil/itinvautodisc.sql` directive, and "itinv.sql"
+#   sorts BEFORE "itinvautodisc.sql", so the alter runs before its table exists
+#   and fails with "Table 'w5base.autodiscrec' doesn't exist". That error halts
+#   the ENTIRE check (mod/base/menu.pm does `last` on a file error), leaving the
+#   schema INCOMPLETE (~158/193 tables) and, crucially, INCONSISTENT — which
+#   makes W5Base divert every authenticated request to the "Table Version
+#   Control" page instead of the menu (the QA-2 primary-acceptance failure).
+#
+#   sql/** is READ-ONLY (AAP §0.6.2 / Preserve Backward Compatibility), so we do
+#   NOT add the missing DEPEND to the source. Instead we mirror the documented
+#   host workaround WITHOUT editing any application/schema file: pre-apply the
+#   dependency file's DDL (with FOREIGN_KEY_CHECKS disabled, exactly as the
+#   framework's own dbtool does) so `autodiscrec` et al. exist, record the file
+#   as fully processed in the `tableversion` tracker so the framework skips
+#   re-creating those tables, then re-run TableVersionCheck. itinv.sql's trailing
+#   alter then succeeds and the remaining files process, yielding the full,
+#   consistent schema (193 tables) with zero SQL errors.
+#
+#   IDEMPOTENT + SELF-DISABLING: the block only fires while itinvautodisc.sql is
+#   not yet fully tracked in `tableversion`. Container restarts (schema already
+#   reconciled) and any future upstream fix that adds the DEPEND both skip it.
+#   All DB access uses the APPLICATION user (as W5Event itself does), MYSQL_PWD
+#   keeps the password out of the process list, and the only interpolated values
+#   are a hardcoded relative path and an integer line count (no injection).
+# ----------------------------------------------------------------------------
+DEP_REL="itil/itinvautodisc.sql"
+DEP_ABS="$W5BASEINSTDIR/sql/$DEP_REL"
+if [ -f "$DEP_ABS" ]; then
+  DEP_LINES="$(wc -l < "$DEP_ABS")"; DEP_LINES="${DEP_LINES//[^0-9]/}"
+  DEP_DONE="$(MYSQL_PWD="$DB_APP_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_APP_USER" -N -B \
+    -e "SELECT COALESCE(MAX(linenumber),-1) FROM \`${DB_NAME}\`.tableversion WHERE filename='${DEP_REL}'" 2>/dev/null || echo -1)"
+  case "$DEP_DONE" in ''|*[!0-9-]*) DEP_DONE=-1 ;; esac
+  if [ "${DEP_DONE:-0}" -lt "${DEP_LINES:-0}" ]; then
+    log "reconciling known schema ordering defect: pre-applying $DEP_REL (itil/itinv.sql lacks its '# DEPEND') ..."
+    # 1) Apply the dependency file's DDL with FK checks off (as the dbtool does),
+    #    so autodiscrec and its sibling autodisc tables exist.
+    if ! { printf 'SET FOREIGN_KEY_CHECKS=0;\n'; cat "$DEP_ABS"; } \
+         | MYSQL_PWD="$DB_APP_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_APP_USER" "$DB_NAME"; then
+      die "schema reconciliation failed: could not pre-apply $DEP_REL"
+    fi
+    # 2) Record it as fully processed (linenumber >= file line count) so
+    #    TableVersionCheck skips re-creating those tables. DELETE+INSERT is used
+    #    (the tableversion table has no UNIQUE key on filename) and is safe: the
+    #    guard above ensures we only reach here when the file is not yet done.
+    MYSQL_PWD="$DB_APP_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_APP_USER" "$DB_NAME" \
+      -e "DELETE FROM tableversion WHERE filename='${DEP_REL}'; \
+          INSERT INTO tableversion (filename,linenumber) VALUES ('${DEP_REL}',${DEP_LINES});" \
+      || die "schema reconciliation failed: could not record tableversion for $DEP_REL"
+    # 3) Re-run TableVersionCheck: itinv.sql's trailing alter now succeeds and
+    #    every remaining file processes.
+    log "re-running TableVersionCheck after dependency pre-seed ..."
+    TVC_LOG2="$(mktemp)"
+    "$W5BASEINSTDIR/sbin/W5Event" -c "$W5APP_CONFIG" -s -d -v TableVersionCheck 2>&1 | tee "$TVC_LOG2" >&2 || true
+    # The reconciled schema MUST now be clean: no syntax errors and no residual
+    # "doesn't exist" ordering errors. Fail loudly if the build did not converge.
+    if grep -Eq 'error in your SQL syntax|ERROR: Line [0-9]+ in file|ERROR: Database error' "$TVC_LOG2"; then
+      log "TableVersionCheck STILL reports errors after reconciliation (first matches):"
+      grep -nE 'error in your SQL syntax|ERROR: Line [0-9]+ in file|ERROR: Database error' "$TVC_LOG2" | head -n 20 >&2 || true
+      rm -f "$TVC_LOG2"
+      die "schema reconciliation did not converge: TableVersionCheck still reports SQL errors after \
+pre-applying $DEP_REL. Inspect the log above; recreate on a fresh volume if needed \
+(docker compose down -v && docker compose up -d --build)."
+    fi
+    rm -f "$TVC_LOG2"
+    log "schema reconciliation complete (full schema, TableVersionCheck clean)"
+  fi
+fi
 
 # Defense-in-depth: W5Event runs the schema build in serverless mode and returns
 # exit 0 even when the build FAILED internally (e.g. the database rejected the
@@ -271,6 +378,34 @@ rm -f "$W5STATEDIR/W5Server.${W5SERVER_CONFIG}.pid"
 log "starting W5Server ..."
 "$W5BASEINSTDIR/sbin/W5Server" -c "$W5SERVER_CONFIG"
 log "W5Server started"
+
+# FAIL FAST if the control plane did not actually come up. sbin/W5Server
+# daemonizes and returns exit 0 to this shell BEFORE its background child binds
+# the listen socket, so a bind failure (historically: Net::Server defaulting to
+# the IPv6 "::" wildcard, which has no loopback in this container) is invisible
+# to `set -e` here and Apache would otherwise start against a DEAD control plane
+# — the exact state that renders "W5Server is not available". We derive the bind
+# address from the rendered w5server.conf (W5ServerPort may be "host:port" or a
+# bare "port") and probe it via bash's /dev/tcp until it accepts a connection.
+# This closes the QA "silent-failure masking" gap for the control plane.
+W5SRV_BIND="$(sed -n 's/^[[:space:]]*W5ServerPort[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' "$W5CONFDIR/w5server.conf" | head -n 1)"
+case "$W5SRV_BIND" in
+  *:*) W5SRV_PROBE_HOST="${W5SRV_BIND%:*}"; W5SRV_PROBE_PORT="${W5SRV_BIND##*:}" ;;
+  *)   W5SRV_PROBE_HOST="127.0.0.1";        W5SRV_PROBE_PORT="${W5SRV_BIND:-12833}" ;;
+esac
+# A wildcard/empty bind host is not directly connectable — probe the loopback.
+case "$W5SRV_PROBE_HOST" in ''|'0.0.0.0'|'*'|'::') W5SRV_PROBE_HOST="127.0.0.1" ;; esac
+log "probing W5Server control plane at $W5SRV_PROBE_HOST:$W5SRV_PROBE_PORT ..."
+probe_tries=0
+until (exec 3<>"/dev/tcp/$W5SRV_PROBE_HOST/$W5SRV_PROBE_PORT") 2>/dev/null; do
+  probe_tries=$((probe_tries + 1))
+  [ "$probe_tries" -ge 30 ] && die "W5Server is not listening on \
+$W5SRV_PROBE_HOST:$W5SRV_PROBE_PORT after $probe_tries attempts. The control plane \
+failed to start - inspect /var/log/w5base/*NetW5Server*.log for a bind error. The \
+web frontend requires a running, reachable W5Server."
+  sleep 1
+done
+log "W5Server control plane is listening on $W5SRV_PROBE_HOST:$W5SRV_PROBE_PORT"
 
 ########################################################################
 # 7. Hand off to Apache in the foreground (container main process).

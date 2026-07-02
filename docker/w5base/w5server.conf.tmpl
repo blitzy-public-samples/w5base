@@ -9,7 +9,9 @@
 # Two values are substituted from the environment at render time:
 #   - W5BASESRVUSER          the service account W5Server runs as (defaults w5base)
 #   - W5BASE_OPERATION_MODE  the operation mode (see W5BaseOperationMode below)
-# All other values are literals mirroring etc/w5base/default.conf.
+# All other values are literals mirroring etc/w5base/default.conf, EXCEPT
+# W5ServerPort, which prefixes the bare port with the IPv4 loopback bind host
+# (see the detailed note above the W5ServerPort directive below).
 #
 # WHY W5BaseOperationMode is rendered HERE (rather than left to inherit
 # etc/w5base/default.conf): the operation mode MUST be IDENTICAL for the control
@@ -20,7 +22,26 @@
 # configs (w5server.conf here and w5base.conf) keeps them in lock-step.
 #
 INCLUDE /etc/w5base/databases.conf
-W5ServerPort="12833"
+#
+# W5ServerPort — the address:port the control plane LISTENS on. It is
+# deliberately prefixed with the IPv4 loopback host (127.0.0.1:) instead of the
+# bare "12833" that etc/w5base/default.conf ships:
+#   sbin/W5Server passes this value straight to Net::Server as its `port`, and
+#   Net::Server's default host ("*") resolves to the IPv6 wildcard "::". Docker
+#   containers in this environment have NO IPv6 address on loopback, so a "::"
+#   bind fails with "[Invalid argument]" (Net/Server/Proto/TCP.pm) and W5Server
+#   dies on startup — 12833 never opens and the web frontend then reports
+#   "W5Server is not available". Pinning the bind to the IPv4 loopback forces a
+#   working listen socket and is consistent with W5ServerAllow="127.0.0.1"
+#   below (W5Server and Apache share this container, so loopback is the only
+#   address the frontend needs to reach it). The port is unchanged (12833).
+#
+# This is the SERVER bind ONLY. The client side (bin/app.pl under Apache, via
+# the w5base config) reads W5ServerHost and W5ServerPort SEPARATELY and is
+# UNAFFECTED: w5base.conf sets no W5ServerPort, so it inherits the bare "12833"
+# and W5ServerHost="localhost" from etc/w5base/default.conf, and connects to
+# 127.0.0.1:12833 — exactly what this server binds.
+W5ServerPort="127.0.0.1:12833"
 W5ServerUser="${W5BASESRVUSER}"
 W5ServerGroup="daemon"
 W5ServerState="/var/opt/w5base/state"
