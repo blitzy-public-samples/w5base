@@ -1,0 +1,54 @@
+# =============================================================================
+# .dockerignore — build-context exclusions for the W5Base application image
+# (NET-NEW, additive companion to the root Dockerfile).
+#
+# WHY this file exists:
+#   The Dockerfile uses `COPY . ${W5BASEINSTDIR}` to place the W5Base source
+#   tree into the image. Without these exclusions the copy would (a) drag the
+#   out-of-scope contrib/ tree into the image, (b) risk baking a local secrets
+#   file into a layer, and (c) bloat the image with large binary docs and the
+#   .git history. Excluding them here is the standard, secure way to keep the
+#   image lean and to satisfy the Dockerfile's validation guarantees
+#   ("image does NOT include contrib/" and "no secrets baked into any layer").
+#
+# What is intentionally KEPT (do NOT add these): docker/ (entrypoint + config
+# templates consumed at runtime), dependence/ (vendored Perl modules compiled
+# at build time), and the application tree (bin/ lib/ mod/ sbin/ sql/ etc/
+# skin/ static/) — the static/ and skin/ assets are required for the main
+# menu to render.
+# =============================================================================
+
+# --- Version-control metadata (never needed inside the image) ----------------
+.git
+.gitignore
+.gitattributes
+
+# --- OUT OF SCOPE: the contributed OracleLinux container and any other contrib
+#     assets must never be copied into this Debian/prefork/mod_perl2 image. -----
+contrib/
+
+# --- Secrets: real environment files must never enter an image layer.
+#     (.env.example carries only placeholders and is harmless, but is not
+#      needed at runtime, so it is excluded too.) --------------------------------
+.env
+.env.*
+
+# --- Large binary documentation (handbook) — excluded via .blitzyignore too. -
+*.odt
+*.pdf
+
+# --- Build-orchestration / CI artifacts that are not part of the app runtime -
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml
+.github/
+
+# --- Blitzy tooling / local scratch — not part of the application ------------
+blitzy/
+blitzy_adhoc_test_*
+
+# --- Common local cruft ------------------------------------------------------
+**/*.swp
+**/*.log
+**/.DS_Store
