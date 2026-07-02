@@ -88,6 +88,113 @@ PASS_ICON="PASS:"
 FAIL_ICON="FAIL:"
 
 # -----------------------------------------------------------------------------
+# Pure input-validation / parsing helpers (no side effects, no I/O). They are
+# defined early so the `--self-test` regression mode below can exercise them
+# WITHOUT requiring Docker or any secret/environment variable.
+# -----------------------------------------------------------------------------
+
+# trim: echo "$1" with leading/trailing ASCII whitespace removed.
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"   # strip leading whitespace
+  s="${s%"${s##*[![:space:]]}"}"   # strip trailing whitespace
+  printf '%s' "$s"
+}
+
+# is_valid_port: return 0 iff $1 is a decimal TCP port in the range 1..65535.
+# EVERY port -- whether env-supplied or parsed from the rendered config -- is
+# validated through this before it is ever placed in a shell command, so a
+# bogus or hostile value can never be executed.
+is_valid_port() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;         # empty or contains a non-digit
+  esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# is_safe_config_name: return 0 iff $1 is a safe W5Base config name -- letters,
+# digits, dot, dash and underscore only. This rejects any value that could
+# inject shell metacharacters or path traversal when the name is interpolated
+# into the "/etc/w5base/<name>.conf" path inside the container.
+is_safe_config_name() {
+  case "${1:-}" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# parse_w5server_port: given the raw text of a rendered "W5ServerPort=..." line
+# (or a bare value), echo the resolved TCP port, or nothing if no valid port is
+# present. The rendered value can be a BARE port ("12833") OR a host:port pair
+# ("127.0.0.1:12833"); for host:port we take the segment after the FINAL colon.
+# A previous implementation captured only the leading digits, so
+# "127.0.0.1:12833" was misread as "127" and Check 1 probed the wrong port and
+# false-failed a healthy W5Server -- the `--self-test` cases below lock this
+# down.
+parse_w5server_port() {
+  local raw="${1:-}" value port
+  case "$raw" in
+    *=*) value="${raw#*=}" ;;        # drop "KEY=" when given a full config line
+    *)   value="$raw" ;;
+  esac
+  value="${value%%#*}"               # strip any trailing inline comment
+  value="$(trim "$value")"
+  case "$value" in                   # strip one layer of surrounding quotes
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  value="$(trim "$value")"
+  port="${value##*:}"                # host:port -> port ; bare port unchanged
+  if is_valid_port "$port"; then
+    printf '%s' "$port"
+  fi
+}
+
+# run_self_test: fast, dependency-free regression coverage for the W5ServerPort
+# parser. It is exercised in CI BEFORE the stack is built (see
+# .github/workflows/smoke.yml) so a parser regression is caught immediately
+# instead of silently false-failing a healthy stack.
+run_self_test() {
+  local failures=0 got
+  assert_port() {                    # $1=input  $2=expected  $3=description
+    got="$(parse_w5server_port "$1")"
+    if [ "$got" = "$2" ]; then
+      log "${PASS_ICON} self-test: $3 ('$1' -> '$got')"
+    else
+      log "${FAIL_ICON} self-test: $3 ('$1' -> '$got', expected '$2')"
+      failures=$((failures + 1))
+    fi
+  }
+  log "=== W5Base smoke-test self-test (W5ServerPort parser) ==="
+  # The exact value docker/w5base/w5server.conf.tmpl renders in this environment
+  # (the regression that motivated this test):
+  assert_port 'W5ServerPort="127.0.0.1:12833"'     '12833' 'rendered host:port line (regression)'
+  assert_port '127.0.0.1:12833'                    '12833' 'bare host:port value'
+  assert_port 'W5ServerPort=12833'                 '12833' 'bare port line'
+  assert_port 'W5ServerPort="12833"'               '12833' 'quoted bare port line'
+  assert_port '  W5ServerPort = "127.0.0.1:4711" ' '4711'  'spaced/quoted host:port (code default port)'
+  # Invalid inputs must yield NO port so the caller falls back to the default:
+  assert_port 'W5ServerPort=""'                    ''      'empty value yields no port'
+  assert_port 'W5ServerPort="127.0.0.1:"'          ''      'missing port after colon yields none'
+  assert_port 'W5ServerPort="70000"'               ''      'out-of-range port yields none'
+  assert_port 'W5ServerPort="abc"'                 ''      'non-numeric yields none'
+  log ""
+  if [ "$failures" -eq 0 ]; then
+    log "self-test RESULT: all parser cases passed"
+    return 0
+  fi
+  log "self-test RESULT: ${failures} parser case(s) FAILED"
+  return 1
+}
+
+# `--self-test` runs the pure regression checks above and exits. It needs
+# neither Docker nor any secret, so it is handled BEFORE .env loading and the
+# required-secret validation further down.
+if [ "${1:-}" = "--self-test" ]; then
+  if run_self_test; then exit 0; else exit 1; fi
+fi
+
+# -----------------------------------------------------------------------------
 # 0. Optionally load a local .env so the script can be run standalone.
 #    Compose injects these automatically; this is only for host convenience.
 #    Never commit real secrets to .env.
@@ -173,6 +280,32 @@ require_env W5BASE_ADMIN
 require_env W5BASE_ADMIN_PASSWORD
 
 # -----------------------------------------------------------------------------
+# 2b. Private credential material for the HTTP Basic main-menu check (Check 2).
+#     The admin password must NEVER be passed on the command line: argv is
+#     world-visible via `ps`/process listings and can leak into CI logs. We
+#     instead write the credentials into a mode-0600 curl config (read via
+#     `curl -K`) and a matching wgetrc (read via $WGETRC) inside a private
+#     mktemp directory, and remove them on exit via a trap. Both the username
+#     and the password come from the environment -- nothing is typed on a
+#     command line or embedded in the script.
+# -----------------------------------------------------------------------------
+CRED_DIR="$(mktemp -d "${TMPDIR:-/tmp}/w5base_smoke.XXXXXX")"
+chmod 700 "${CRED_DIR}"
+CURL_CRED_FILE="${CRED_DIR}/curl.cfg"
+WGET_CRED_FILE="${CRED_DIR}/wgetrc"
+# shellcheck disable=SC2317  # invoked indirectly by the EXIT/INT/TERM trap below
+cleanup_creds() { rm -rf "${CRED_DIR}" 2>/dev/null || true; }
+trap cleanup_creds EXIT INT TERM
+# curl config: `user = "<user>:<password>"` is equivalent to `-u` but keeps the
+# secret out of argv. wgetrc: http_user/http_password do the same for wget.
+printf 'user = "%s:%s"\n' "${W5BASE_ADMIN}" "${W5BASE_ADMIN_PASSWORD}" > "${CURL_CRED_FILE}"
+{
+  printf 'http_user=%s\n'     "${W5BASE_ADMIN}"
+  printf 'http_password=%s\n' "${W5BASE_ADMIN_PASSWORD}"
+} > "${WGET_CRED_FILE}"
+chmod 600 "${CURL_CRED_FILE}" "${WGET_CRED_FILE}"
+
+# -----------------------------------------------------------------------------
 # Single choke point for running a command against the application container.
 #   * inside the container  -> run the command directly
 #   * from the host         -> wrap in `<compose> exec -T <service>`
@@ -204,30 +337,67 @@ record_fail() { FAILED=$((FAILED + 1)); TOTAL=$((TOTAL + 1)); SUMMARY+=("${FAIL_
 detect_w5server_port() {
   # Priority: explicit env override -> value in the rendered w5server.conf
   # inside the container -> this environment's documented default (12833).
+  #
+  # SECURITY/CORRECTNESS: every candidate is normalized through
+  # parse_w5server_port (which accepts bare ports AND host:port pairs, taking
+  # the segment after the FINAL colon) and validated as a 1..65535 TCP port
+  # before use. The config NAME is validated against a strict charset and is
+  # passed to the container shell as a POSITIONAL PARAMETER, never interpolated
+  # into the command text -- so neither a malformed config value nor a hostile
+  # W5BASE_SERVER_CONFIG can inject shell syntax.
+
+  # 1. Explicit override wins (a host:port override is accepted and normalized).
   if [ -n "${W5BASE_SERVER_PORT:-}" ]; then
-    printf '%s' "${W5BASE_SERVER_PORT}"
-    return 0
+    local override
+    override="$(parse_w5server_port "${W5BASE_SERVER_PORT}")"
+    if is_valid_port "${override}"; then
+      printf '%s' "${override}"
+      return 0
+    fi
+    info "ignoring invalid W5BASE_SERVER_PORT='${W5BASE_SERVER_PORT}' (not a 1..65535 port)"
   fi
-  local detected=""
-  detected="$(in_w5base sh -c "grep -iE '^[[:space:]]*W5ServerPort[[:space:]]*=' /etc/w5base/${W5BASE_SERVER_CONFIG}.conf 2>/dev/null | head -n1" 2>/dev/null \
-              | sed -E 's/^[^=]*=[[:space:]]*\"?([0-9]+)\"?.*/\1/' || true)"
-  if printf '%s' "${detected}" | grep -qE '^[0-9]+$'; then
-    printf '%s' "${detected}"
-    return 0
+
+  # 2. Read the rendered config -- only when the config name is safe. The name
+  #    is passed as $1 to the container shell (positional), not interpolated.
+  if is_safe_config_name "${W5BASE_SERVER_CONFIG}"; then
+    local raw port
+    # shellcheck disable=SC2016  # $1 is a POSITIONAL PARAM for the container sh -c, intentionally NOT expanded here (F3 injection hardening)
+    raw="$(in_w5base sh -c \
+        'grep -iE "^[[:space:]]*W5ServerPort[[:space:]]*=" "/etc/w5base/$1.conf" 2>/dev/null | head -n1' \
+        sh "${W5BASE_SERVER_CONFIG}" 2>/dev/null || true)"
+    port="$(parse_w5server_port "${raw}")"
+    if is_valid_port "${port}"; then
+      printf '%s' "${port}"
+      return 0
+    fi
+  else
+    info "W5BASE_SERVER_CONFIG='${W5BASE_SERVER_CONFIG}' has unsafe characters; skipping config probe"
   fi
+
+  # 3. This environment's documented default (see DEFAULT_W5SERVER_PORT).
   printf '%s' "${DEFAULT_W5SERVER_PORT}"
 }
 
 check_w5server_up() {
   local port
   port="$(detect_w5server_port)"
+  # detect_w5server_port only ever returns a validated port, but re-check here
+  # as defense in depth before the value is used in any shell context.
+  if ! is_valid_port "${port}"; then
+    record_fail "could not determine a valid W5Server port (got '${port}')"
+    return 1
+  fi
   info "Check 1: probing W5Server TCP port ${port} on 127.0.0.1 (inside container)"
-  # bash /dev/tcp is guaranteed (Debian base ships bash); nc is a fallback.
-  if in_w5base bash -c "exec 3<>/dev/tcp/127.0.0.1/${port} && exec 3>&-" >/dev/null 2>&1; then
+  # The port is passed as a POSITIONAL PARAMETER ($1) to the container shell and
+  # never interpolated into the command string. bash /dev/tcp is guaranteed
+  # (the Debian base ships bash); nc is a fallback.
+  # shellcheck disable=SC2016  # $1 is a POSITIONAL PARAM for the container shell, intentionally NOT expanded here (F3 injection hardening)
+  if in_w5base bash -c 'exec 3<>/dev/tcp/127.0.0.1/"$1" && exec 3>&-' bash "${port}" >/dev/null 2>&1; then
     record_pass "W5Server is up (TCP 127.0.0.1:${port} reachable inside '${W5BASE_SERVICE}')"
     return 0
   fi
-  if in_w5base sh -c "command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 ${port}" >/dev/null 2>&1; then
+  # shellcheck disable=SC2016  # $1 is a POSITIONAL PARAM for the container shell, intentionally NOT expanded here (F3 injection hardening)
+  if in_w5base sh -c 'command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$1"' sh "${port}" >/dev/null 2>&1; then
     record_pass "W5Server is up (TCP 127.0.0.1:${port} reachable via nc inside '${W5BASE_SERVICE}')"
     return 0
   fi
@@ -239,13 +409,16 @@ check_w5server_up() {
 # Check 2 -- Main menu renders (HTTP 200) -- the PRIMARY acceptance signal.
 # =============================================================================
 http_status() {
-  local url="$1" user="$2" pass="$3" out=""
+  local url="$1" out=""
   if command -v curl >/dev/null 2>&1; then
-    # curl prints the numeric status (000 when it cannot connect); capture once.
-    out="$(curl -sS -o /dev/null -w '%{http_code}' -u "${user}:${pass}" "${url}" 2>/dev/null)" || true
+    # -K reads the Basic-auth credentials from the mode-0600 curl config, so the
+    # password never appears in argv. curl prints the numeric status (000 when
+    # it cannot connect); capture it once.
+    out="$(curl -sS -o /dev/null -w '%{http_code}' -K "${CURL_CRED_FILE}" "${url}" 2>/dev/null)" || true
     printf '%s' "${out:-000}"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O /dev/null --server-response --user="${user}" --password="${pass}" "${url}" 2>&1 \
+    # $WGETRC supplies http_user/http_password, keeping the password out of argv.
+    WGETRC="${WGET_CRED_FILE}" wget -q -O /dev/null --server-response "${url}" 2>&1 \
       | awk 'tolower($1)=="http/1.0"||tolower($1)=="http/1.1"{code=$2} END{printf "%s", (code==""?"000":code)}'
   else
     printf '000'
@@ -270,7 +443,7 @@ check_main_menu() {
 
   local attempt=1 code="000"
   while [ "${attempt}" -le "${HTTP_RETRIES}" ]; do
-    code="$(http_status "${url}" "${W5BASE_ADMIN}" "${W5BASE_ADMIN_PASSWORD}")"
+    code="$(http_status "${url}")"
     if [ "${code}" = "200" ]; then
       record_pass "main menu renders (HTTP 200) at ${url}"
       return 0

@@ -48,19 +48,36 @@ path, control plane), read [`./ARCHITECTURE.md`](./ARCHITECTURE.md).
   ```
 
 - **Network access on the first build.** The initial image build pulls the
-  Debian base image, installs Apache/mod_perl2 and the system Perl module set
-  via `apt`, and performs the Git checkout. Subsequent builds are cached and fast.
+  Debian base image and installs Apache/mod_perl2, the system Perl module set,
+  and the build toolchain via `apt`. It does **not** perform a Git checkout:
+  the build copies your already-checked-out working tree into the image with
+  explicit `COPY --chown=w5base:daemon …` directives (see the `COPY` lines in the
+  [`Dockerfile`](../Dockerfile)), then builds the Perl dependencies it needs from
+  source. (`git` is installed in the image only as tooling that modernizes the
+  legacy SVN recipe, not to fetch code during the build — so you clone/checkout
+  the repository yourself *before* running Compose, as in the next bullet.)
+  Subsequent builds are cached and fast.
 
 - **The repository, checked out on the `blitzy` branch.** All commands below are
   run from the repository root (the directory that contains `Dockerfile`,
   `docker-compose.yml`, and `.env.example`).
 
-- **Patience on the first build.** The image compiles the vendored *"mandatory"*
-  Perl modules from `dependence/mandatory` — `RPC-Smart`, `IPC-Smart`,
-  `DateTime-Set`, `Data-HexDump`, `Spreadsheet-WriteExcel`, and `Env-C`. This is
-  why the first build takes several minutes. **Why it matters:** `RPC::Smart` is
-  a hard prerequisite of the control plane — `sbin/W5Server` and the shell entry
-  points such as `sbin/W5Event` `use RPC::Smart::Client` to talk over TCP, so the
+- **Patience on the first build.** From `dependence/mandatory` the image compiles
+  only the vendored Perl modules that are genuinely required **and** are not
+  available as a reliable Debian package — `RPC-Smart`, `Env-C`, and
+  `HTML-TagFilter` — each with the standard `perl Makefile.PL && make && make
+  install` flow, and each **failing the build on error** (no best-effort masking
+  that could let the image build while `sbin/W5InstallCheck` later fails). The
+  other modules the install checker needs — `DateTime::Set`, `Data::HexDump`, and
+  `Spreadsheet::WriteExcel` — are installed from Debian packages
+  (`libdatetime-set-perl`, `libdata-hexdump-perl`, `libspreadsheet-writeexcel-perl`),
+  so they are **not** built from source. `IPC-Smart` is **omitted entirely**: it is
+  unused by the kernel, absent from every `sbin/W5InstallCheck` probe (the check
+  exits `0` without it), and does not compile on a modern gcc/glibc toolchain — so
+  building it would add only a guaranteed-failing step. This source build is why
+  the first build takes several minutes. **Why it matters:** `RPC::Smart` is a hard
+  prerequisite of the control plane — `sbin/W5Server` and the shell entry points
+  such as `sbin/W5Event` `use RPC::Smart::Client` to talk over TCP, so the
   environment cannot boot without it.
 
 - **Resources.** Budget roughly **~4 GB of free disk** and a couple of GB of RAM.
@@ -212,10 +229,20 @@ reason:
    `sbin/W5Event ... -v TableVersionCheck` completes with no schema errors
    (`README.txt` L453-L459).
 
-You can reproduce signal (2) manually from your host with `curl`:
+You can reproduce signal (2) manually from your host with `curl`. Pass the admin
+credentials through a **temporary, mode-`0600` curl config file** rather than on
+the command line, so the password never appears in your shell history or in
+process listings (`ps`). This is the same non-argv mechanism the automated
+[smoke test](../tests/smoke/w5base_smoke_test.sh) uses:
 
 ```bash
-curl -u "$W5BASE_ADMIN:$W5BASE_ADMIN_PASSWORD" \
+# Write the Basic-auth credentials into a private 0600 file (never on the argv)...
+cred="$(mktemp)"; chmod 600 "$cred"
+printf 'user = "%s:%s"\n' "$W5BASE_ADMIN" "$W5BASE_ADMIN_PASSWORD" > "$cred"
+# ...remove it automatically when the shell exits...
+trap 'rm -f "$cred"' EXIT
+# ...and let curl read the credentials from the file with -K:
+curl -K "$cred" \
      -s -o /dev/null -w '%{http_code}\n' \
      "$W5BASE_BASE_URL/w5base/auth/base/menu/root"   # expect 200
 ```

@@ -76,6 +76,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 1b. Fast, dependency-free regression check of the smoke test's own
+      #     W5ServerPort parser BEFORE building the stack. This runs
+      #     `w5base_smoke_test.sh --self-test`, which needs neither Docker nor
+      #     any secret, and asserts that host:port config values (e.g.
+      #     "127.0.0.1:12833") resolve to the correct port. It fails the job
+      #     immediately if the parser regresses, so a broken parser can never
+      #     silently false-fail (or false-pass) the health gate below.
+      - name: Smoke-test parser self-test (no Docker required)
+        run: |
+          chmod +x ./tests/smoke/w5base_smoke_test.sh
+          ./tests/smoke/w5base_smoke_test.sh --self-test
+
       # 2. Provision the runtime .env from the committed template, then override
       #    the secret & coordination values with CI placeholders (dotenv
       #    last-wins semantics, which docker compose env_file and the smoke
