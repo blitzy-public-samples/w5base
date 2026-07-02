@@ -3,9 +3,9 @@
 > **Scope.** This guide documents [`mod/itil`](../../mod/itil), the **largest**
 > module in W5Base and the heart of its **CMDB / ITSM** capability
 > (Configuration Management Database / IT Service Management). It assumes you have
-> read the [Kernel guide](./kernel.md) — every object here is a **declared data
-> object** built on that kernel, so `mod/itil` is really the framework shown *at
-> full scale*. For the system-wide request path and control plane see the
+> read the [Kernel guide](./kernel.md) — nearly every object here is a **declared
+> data object** built on that kernel, so `mod/itil` is really the framework shown
+> *at full scale*. For the system-wide request path and control plane see the
 > [Architecture Overview](../ARCHITECTURE.md); to stand the stack up locally see
 > the [Local Setup runbook](../LOCAL_SETUP.md). The compact [CRM guide](./crm.md)
 > teaches the module *anatomy* this large module reuses.
@@ -46,16 +46,21 @@ Database (CMDB)** and the surrounding **IT Service Management (ITSM)** domain. I
 declares the configuration items (CIs) of an IT estate — applications, hardware
 and assets, systems and software, networking, cloud/cluster/farm groupings, the
 business layer, and contracts/licenses — **and the relationships between them**.
-It is the **largest** module in the repository: **~122 top-level `.pm` data
-objects** (243 `.pm` counting subdirectories).
+It is the **largest** module in the repository: **~122 top-level `.pm` files**
+(243 `.pm` counting subdirectories) — **nearly all of them declared data
+objects**, alongside a small number of web/helper classes.
 
 **Why it is large — breadth, not depth.** A CMDB is valuable only if it can
 represent nearly everything in an estate *and* how those things depend on one
 another, so the object count is inherently high. Crucially, that size is **not**
-plumbing: every top-level `.pm` is a **declared data object** that inherits the
-kernel base class (typically `kernel::DataObj::DB`) and expresses itself as a
-field list, exactly as taught in the [Kernel guide](./kernel.md). `mod/itil` is
-therefore the framework demonstrated **at full scale** — broad, not deep.
+plumbing: **nearly every** top-level `.pm` is a **declared data object** that
+inherits the kernel base class (typically `kernel::DataObj::DB`, directly or
+through an ITIL/CRM/finance base) and expresses itself as a field list, exactly
+as taught in the [Kernel guide](./kernel.md). A small number of top-level files
+are **web/helper classes** instead — for example
+[`FaultAnalytics.pm`](../../mod/itil/FaultAnalytics.pm) inherits
+`kernel::App::Web`, not `kernel::DataObj::DB`. `mod/itil` is therefore the
+framework demonstrated **at full scale** — broad, not deep.
 
 **How to read this guide.** Rather than enumerate 122 files, this guide groups the
 objects into **families** (§5) and then explains the **link objects** (§6) that
@@ -110,9 +115,9 @@ Each ancestor contributes exactly one capability:
 | [`kernel::MandatorDataACL`](../../lib/kernel/MandatorDataACL.pm) | Multi-tenant field-level ACL |
 | [`itil::lib::Listedit`](../../mod/itil/lib/Listedit.pm) | ITIL-wide shared list/edit conventions (§4) |
 
-Once you recognize this pattern, every object in the module reads the same way:
-**inherit the plumbing, then declare fields.** Leaner objects use a shorter
-ancestry — e.g. [`asset.pm`](../../mod/itil/asset.pm) declares
+Once you recognize this pattern, nearly every object in the module reads the
+same way: **inherit the plumbing, then declare fields.** Leaner objects use a
+shorter ancestry — e.g. [`asset.pm`](../../mod/itil/asset.pm) declares
 `@ISA=qw(kernel::App::Web::Listedit kernel::DataObj::DB kernel::CIStatusTools)`.
 
 ---
@@ -343,7 +348,7 @@ consistent with the kernel's extension model in
 
 - **Understand the engine first:** the [Kernel guide](./kernel.md) — the base
   classes (`kernel::DataObj`, `kernel::Field`, the storage backends, the ACL) that
-  every object here inherits.
+  nearly every object here inherits.
 - **See the minimal module anatomy:** the [CRM guide](./crm.md) — the same
   structure this large module reuses, taught on just five files.
 - **See the framework end-to-end:** the [Architecture Overview](../ARCHITECTURE.md)
