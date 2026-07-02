@@ -8,8 +8,14 @@
 # share one DB definition.
 #
 # Only two values are substituted from the environment at render time:
-#   - W5BASE_DSN         : the DBI connect string (must target host=db, the
-#                          Compose service name, NOT localhost).
+#   - W5BASE_DSN         : the DBI connect string for DATAOBJCONNECT. This is a
+#                          DBI DSN ("dbi:mysql:...") and should target host=db,
+#                          the Compose service name, NOT localhost. NOTE:
+#                          docker/entrypoint.sh NORMALIZES W5BASE_DSN before
+#                          rendering -- a URL-form value (mysql://user:pass@host:
+#                          port/db) is converted to the equivalent DBI form, and
+#                          a DBI-form value is passed through unchanged -- so the
+#                          value substituted here is always a valid DBI DSN.
 #   - W5BASE_DB_PASSWORD : the w5base application DB password (never hardcoded).
 # The bracket index [w5base] is the data-object connection name and is a
 # LITERAL — envsubst leaves it untouched.

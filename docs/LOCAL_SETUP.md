@@ -194,6 +194,22 @@ On success, the generated main-menu mask renders at
 `/w5base/auth/base/menu/root`. **That render is the acceptance signal for the
 whole environment.**
 
+**Why the first login reaches the menu (and not a verification page).** W5Base's
+kernel treats an authenticated identity that is not yet linked to an *active*
+internal `contact` record as a brand-new user, and diverts every request to a
+first-login **account-verification** page — and then a **GTC-acceptance** page.
+Completing those pages requires an e-mail round-trip through an SMTP server,
+which this minimal development base intentionally does **not** run (mail, LDAP,
+and Oracle are out of scope). To keep the "one command → main menu" promise,
+`docker/entrypoint.sh` **seeds an active, GTC-accepted `contact` for
+`MASTERADMIN` and links it to the login account** immediately after the schema
+build. This writes only the same runtime *data* rows the framework itself would
+create once verification completed — it changes **no application code and no
+schema** — so your first login lands directly on the menu. The seed is
+**idempotent** (skipped once the admin account is already active), and the
+seeded contact's e-mail defaults to `${W5BASE_ADMIN}@w5base.local` (override with
+the optional `W5BASE_ADMIN_EMAIL` in `.env`).
+
 > **Note on the DB host.** Unlike the legacy single-host install, the app and
 > database run in **separate containers**. The database host in `W5BASE_DSN` is
 > therefore the Compose **service name `db`** (e.g.
@@ -219,9 +235,14 @@ reason:
    persistent control-plane process server — *"The W5Base Web-Frontend needs a
    running sbin/W5Server"* (`README.txt` L481-L483). If it is down, pages error
    and events never complete.
-2. **HTTP `200` at `/w5base/auth/base/menu/root`.** This proves the generated
-   main-menu mask actually renders end-to-end (Apache → mod_perl2 → `bin/app.pl`
-   → kernel → database).
+2. **The main menu renders at `/w5base/auth/base/menu/root`.** The smoke test
+   requires HTTP `200` **and** verifies the response *body* is the real main-menu
+   frameset (it contains the `menutop` + `msel` navigation iframes). A bare `200`
+   is deliberately **not** treated as sufficient: the kernel also returns `200`
+   for the first-login *account verification* and *GTC verification* gates, so
+   the test explicitly rejects those pages and passes only on the actual menu —
+   proving it renders end-to-end (Apache → mod_perl2 → `bin/app.pl` → kernel →
+   database).
 3. **`sbin/W5InstallCheck` reports a healthy install.** This tool verifies the
    integrity of the installation and catches most setup mistakes
    (`README.txt` L448-L451).
@@ -239,16 +260,26 @@ process listings (`ps`). This is the same non-argv mechanism the automated
 # Write the Basic-auth credentials into a private 0600 file (never on the argv)...
 cred="$(mktemp)"; chmod 600 "$cred"
 printf 'user = "%s:%s"\n' "$W5BASE_ADMIN" "$W5BASE_ADMIN_PASSWORD" > "$cred"
-# ...remove it automatically when the shell exits...
-trap 'rm -f "$cred"' EXIT
+# ...save the body so we can confirm it is the MENU, not a 200-returning gate...
+body="$(mktemp)"
+# ...remove both automatically when the shell exits...
+trap 'rm -f "$cred" "$body"' EXIT
 # ...and let curl read the credentials from the file with -K:
-curl -K "$cred" \
-     -s -o /dev/null -w '%{http_code}\n' \
-     "$W5BASE_BASE_URL/w5base/auth/base/menu/root"   # expect 200
+code="$(curl -K "$cred" -s -o "$body" -w '%{http_code}' \
+        "$W5BASE_BASE_URL/w5base/auth/base/menu/root")"
+echo "HTTP $code"
+# The main-menu frameset contains the menutop + msel navigation iframes; the
+# first-login gates (which also return 200) do not.
+grep -qi 'menutop' "$body" && grep -qi 'msel' "$body" \
+  && echo "OK: main menu rendered" \
+  || echo "NOT the menu (a 200 here is likely the account-verification / GTC gate)"
 ```
 
-A `200` confirms the menu renders for the admin identity; a `401` means the
-Basic-auth credentials did not match the container `htpasswd` (re-check
+A `200` **with** the `menutop`/`msel` menu frames confirms the main menu rendered
+for the admin identity. A `200` **without** them means you reached a first-login
+*account verification* or *GTC* gate — verify that `docker/entrypoint.sh` seeded
+the `MASTERADMIN` contact (see [§3, First Login](#3-first-login)). A `401` means
+the Basic-auth credentials did not match the container `htpasswd` (re-check
 `W5BASE_ADMIN` / `W5BASE_ADMIN_PASSWORD` in `.env`).
 
 ---

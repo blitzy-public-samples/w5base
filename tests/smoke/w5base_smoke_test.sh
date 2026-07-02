@@ -14,10 +14,20 @@
 #   Check 1  W5Server is up ......... the persistent TCP control plane is
 #                                     listening (reachable on its configured
 #                                     port from inside the app container).
-#   Check 2  Main menu renders ...... HTTP 200 at
+#   Check 2  Main menu renders ...... HTTP 200 AND the response body is the
+#                                     actual main-menu frameset at
 #                                     ${W5BASE_BASE_URL}/w5base/auth/base/menu/root
 #                                     using HTTP Basic auth (the PRIMARY
 #                                     acceptance signal for the whole stack).
+#                                     Status 200 ALONE is NOT sufficient: the
+#                                     kernel also returns 200 for the first-login
+#                                     "account verification" and "GTC
+#                                     verification" gates, so this check inspects
+#                                     the body for the menu shell (the menutop +
+#                                     msel navigation iframes) and FAILS if it
+#                                     sees a verification gate instead. This is
+#                                     what makes "menu renders" mean the menu,
+#                                     not merely a 200 (QA FINAL-B Info-3).
 #   Check 3  Install is healthy ..... sbin/W5InstallCheck reports a healthy
 #                                     install (exit 0).
 #   Check 4  Schema is reconciled ... sbin/W5Event ... TableVersionCheck runs
@@ -406,23 +416,58 @@ check_w5server_up() {
 }
 
 # =============================================================================
-# Check 2 -- Main menu renders (HTTP 200) -- the PRIMARY acceptance signal.
+# Check 2 -- Main menu RENDERS -- the PRIMARY acceptance signal.
+#
+# A bare HTTP 200 is NOT sufficient proof: the W5Base kernel returns 200 for its
+# first-login "account verification" and "GTC verification" gates too, so a
+# status-only check would report success while the developer is actually stuck
+# on a gate and the main menu is unreachable (the exact QA FINAL-B Issue #1 /
+# Info-3 failure). This check therefore fetches the response BODY and asserts it
+# is the real main-menu frameset before passing.
 # =============================================================================
-http_status() {
-  local url="$1" out=""
+
+# fetch_url <url> <body_out_file>: GET the URL with HTTP Basic auth, save the
+# response body to <body_out_file>, and print the numeric HTTP status (000 on a
+# connection failure). Credentials are read from the mode-0600 curl config / the
+# wgetrc so the password never appears in argv (same posture as before).
+fetch_url() {
+  local url="$1" body="$2" out=""
+  : > "${body}" 2>/dev/null || true
   if command -v curl >/dev/null 2>&1; then
-    # -K reads the Basic-auth credentials from the mode-0600 curl config, so the
-    # password never appears in argv. curl prints the numeric status (000 when
-    # it cannot connect); capture it once.
-    out="$(curl -sS -o /dev/null -w '%{http_code}' -K "${CURL_CRED_FILE}" "${url}" 2>/dev/null)" || true
+    out="$(curl -sS -o "${body}" -w '%{http_code}' -K "${CURL_CRED_FILE}" "${url}" 2>/dev/null)" || true
     printf '%s' "${out:-000}"
   elif command -v wget >/dev/null 2>&1; then
     # $WGETRC supplies http_user/http_password, keeping the password out of argv.
-    WGETRC="${WGET_CRED_FILE}" wget -q -O /dev/null --server-response "${url}" 2>&1 \
-      | awk 'tolower($1)=="http/1.0"||tolower($1)=="http/1.1"{code=$2} END{printf "%s", (code==""?"000":code)}'
+    # Body -> file; server-response headers -> a sidecar we parse for the status.
+    local hdr="${body}.hdr"
+    WGETRC="${WGET_CRED_FILE}" wget -q -O "${body}" --server-response "${url}" 2>"${hdr}" || true
+    awk 'tolower($1)=="http/1.0"||tolower($1)=="http/1.1"{code=$2} END{printf "%s", (code==""?"000":code)}' "${hdr}" 2>/dev/null || printf '000'
+    rm -f "${hdr}" 2>/dev/null || true
   else
     printf '000'
   fi
+}
+
+# body_is_account_gate <body_file> / body_is_gtc_gate <body_file>: recognize the
+# two 200-returning first-login gates by their page titles (set in
+# lib/kernel/App/Web.pm). Used both to REJECT a gate as "menu renders" and to
+# emit a precise, actionable failure message.
+body_is_account_gate() { grep -qiE 'account verification' "$1"; }
+body_is_gtc_gate()     { grep -qiE 'GTC verification'     "$1"; }
+
+# body_is_main_menu <body_file>: TRUE only when the body is the actual main-menu
+# frameset. The base::menu root mask renders a two-iframe shell -- a top
+# navigation bar (name=menutop, MOD=base::menu&FUNC=root) and the menu-tree
+# selector (name=msel) -- neither of which appears on the verification gates.
+# Requiring BOTH iframe names (and explicitly rejecting the gate titles) is what
+# makes this assert "the MENU rendered", not merely "a 200 came back".
+body_is_main_menu() {
+  local body="$1"
+  [ -s "${body}" ] || return 1
+  if body_is_account_gate "${body}" || body_is_gtc_gate "${body}"; then
+    return 1
+  fi
+  grep -qi 'menutop' "${body}" && grep -qi 'msel' "${body}"
 }
 
 check_main_menu() {
@@ -441,12 +486,27 @@ check_main_menu() {
     return 1
   fi
 
+  # Response body goes into the private, mode-700 CRED_DIR so it is removed by the
+  # existing cleanup trap and never world-readable.
+  local body="${CRED_DIR}/menu_body.html"
   local attempt=1 code="000"
   while [ "${attempt}" -le "${HTTP_RETRIES}" ]; do
-    code="$(http_status "${url}")"
+    code="$(fetch_url "${url}" "${body}")"
     if [ "${code}" = "200" ]; then
-      record_pass "main menu renders (HTTP 200) at ${url}"
-      return 0
+      # 200 received -- the body content is now deterministic (driven by DB
+      # state, not warm-up), so decide pass/fail from the body immediately.
+      if body_is_main_menu "${body}"; then
+        record_pass "main menu renders at ${url} (HTTP 200 + menu frameset: menutop/msel iframes present)"
+        return 0
+      fi
+      if body_is_account_gate "${body}"; then
+        record_fail "main menu URL returned HTTP 200 but rendered the first-login ACCOUNT VERIFICATION gate, not the menu, at ${url} -- seed an active MASTERADMIN account (docker/entrypoint.sh) so first login reaches the menu"
+      elif body_is_gtc_gate "${body}"; then
+        record_fail "main menu URL returned HTTP 200 but rendered the GTC VERIFICATION gate, not the menu, at ${url} -- the MASTERADMIN account needs an accepted-GTC state"
+      else
+        record_fail "main menu URL returned HTTP 200 but the body is not the menu frameset (menutop/msel iframes absent) at ${url}"
+      fi
+      return 1
     fi
     info "  attempt ${attempt}/${HTTP_RETRIES}: HTTP ${code} (app may still be warming up)"
     if [ "${attempt}" -lt "${HTTP_RETRIES}" ]; then

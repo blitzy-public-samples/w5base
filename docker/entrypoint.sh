@@ -71,18 +71,64 @@ DB_APP_USER="${MYSQL_USER:-w5base}"
 DB_APP_PASS="${W5BASE_DB_PASSWORD:-${MYSQL_PASSWORD:-}}"
 DB_ROOT_PASS="${MYSQL_ROOT_PASSWORD:-}"
 
+# --- Normalize W5BASE_DSN into a valid DBD::mysql (DBI) connect string --------
+# DATAOBJCONNECT[w5base] in databases.conf MUST be a DBI DSN ("dbi:mysql:...") --
+# that is exactly the string kernel::DataObj::DB hands to DBI->connect. But
+# W5BASE_DSN may legitimately arrive in EITHER of two shapes:
+#   * DBI form : dbi:mysql:database=w5base;host=db;port=3306   (or dbi:mysql:w5base)
+#   * URL form : mysql://user:pass@host:3306/w5base
+# Rendering a URL-form value verbatim would yield a NON-DBI DATAOBJCONNECT and the
+# application could not connect (QA FINAL-B Info-2). We canonicalize here:
+#   - a DBI-form DSN is passed through UNCHANGED (it may intentionally use a unix
+#     socket by omitting host=, so we must not second-guess it), and
+#   - a URL-form DSN is converted to the equivalent DBI form.
+# Host/port are ALSO extracted (from whichever form) for this script's own DB
+# provisioning + readiness probe. Explicit W5BASE_DB_HOST / W5BASE_DB_PORT win.
 DB_HOST="${W5BASE_DB_HOST:-}"
 DB_PORT="${W5BASE_DB_PORT:-}"
+DSN_DBI="${W5BASE_DSN:-}"
 if [ -n "${W5BASE_DSN:-}" ]; then
   case "$W5BASE_DSN" in
-    *host=*) [ -z "$DB_HOST" ] && DB_HOST="$(printf '%s' "$W5BASE_DSN" | sed -n 's/.*host=\([^;:]*\).*/\1/p')" ;;
-  esac
-  case "$W5BASE_DSN" in
-    *port=*) [ -z "$DB_PORT" ] && DB_PORT="$(printf '%s' "$W5BASE_DSN" | sed -n 's/.*port=\([^;:]*\).*/\1/p')" ;;
+    [Dd][Bb][Ii]:*)
+      # Already DBI form -> keep verbatim; only harvest host=/port= if present.
+      case "$W5BASE_DSN" in
+        *host=*) [ -z "$DB_HOST" ] && DB_HOST="$(printf '%s' "$W5BASE_DSN" | sed -n 's/.*host=\([^;:]*\).*/\1/p')" ;;
+      esac
+      case "$W5BASE_DSN" in
+        *port=*) [ -z "$DB_PORT" ] && DB_PORT="$(printf '%s' "$W5BASE_DSN" | sed -n 's/.*port=\([^;:]*\).*/\1/p')" ;;
+      esac
+      ;;
+    *://*)
+      # URL form: scheme://[user[:pass]@]host[:port][/db][?params] -> DBI form.
+      # Pure shell parameter expansion (no eval); tolerant of '@' inside the
+      # password (we split on the LAST '@') and of a missing port and/or db.
+      _dsn_rest="${W5BASE_DSN#*://}"            # strip "scheme://"
+      _dsn_auth="${_dsn_rest%%/*}"              # "[user:pass@]host[:port]"
+      _dsn_auth="${_dsn_auth##*@}"              # drop optional "user:pass@"
+      _dsn_urlhost="${_dsn_auth%%:*}"           # host
+      case "$_dsn_auth" in
+        *:*) _dsn_urlport="${_dsn_auth##*:}" ;;
+        *)   _dsn_urlport="" ;;
+      esac
+      case "$_dsn_rest" in                      # database = path segment (if any)
+        */*) _dsn_urldb="${_dsn_rest#*/}"; _dsn_urldb="${_dsn_urldb%%\?*}"; _dsn_urldb="${_dsn_urldb%%/*}" ;;
+        *)   _dsn_urldb="" ;;
+      esac
+      [ -z "$DB_HOST" ] && DB_HOST="$_dsn_urlhost"
+      [ -z "$DB_PORT" ] && DB_PORT="$_dsn_urlport"
+      DSN_DBI="dbi:mysql:database=${_dsn_urldb:-$DB_NAME};host=${_dsn_urlhost:-${DB_HOST:-db}};port=${_dsn_urlport:-${DB_PORT:-3306}}"
+      log "normalized URL-form W5BASE_DSN into DBI form for DATAOBJCONNECT"
+      ;;
+    *)
+      log "WARNING: W5BASE_DSN is neither DBI ('dbi:...') nor URL ('scheme://...') form; rendering it verbatim"
+      ;;
   esac
 fi
 DB_HOST="${DB_HOST:-db}"       # compose service name
 DB_PORT="${DB_PORT:-3306}"
+# Re-export so the databases.conf template (envsubst ${W5BASE_DSN}) renders the
+# canonical DBI form and every downstream consumer sees one consistent value.
+export W5BASE_DSN="$DSN_DBI"
 
 log "INSTDIR=$W5BASEINSTDIR SRVUSER=$W5BASESRVUSER DB=$DB_APP_USER@$DB_HOST:$DB_PORT/$DB_NAME mode=$W5BASE_OPERATION_MODE"
 
@@ -369,6 +415,89 @@ docker/mysql/my.cnf sets sql_mode=\"\" (see README.txt gotchas), then recreate t
 fresh volume: docker compose down -v && docker compose up -d --build."
 fi
 log "schema build complete ($schema_tables tables present)"
+
+########################################################################
+# 5b. Seed the MASTERADMIN account so FIRST LOGIN lands on the MAIN MENU
+#     (not the kernel's first-login "account verification" gate).
+#
+#  WHY (QA FINAL-B Issue #1, MAJOR): W5Base's kernel (mod/base, READ-ONLY)
+#  treats an authenticated user whose login has no linked, ACTIVE `contact`
+#  record as a brand-new user and diverts every request to an e-mail
+#  "account verification" page, then a GTC-acceptance page
+#  (lib/kernel/App/Web.pm: the `if (!defined($uarec->{userid}))` first-login
+#  gate and the cistatusid!=4 / empty-gtcack lock gate). Completing that flow
+#  needs an SMTP round-trip the minimal dev base intentionally does NOT provide
+#  (mail/LDAP/Oracle are out of scope, AAP 0.6.2), so the admin can never
+#  self-complete it and the AAP's concrete acceptance -- "one command -> a
+#  running, logged-in W5Base MAIN MENU at /w5base/auth/base/menu/root"
+#  (AAP 0.1.1 / 0.5.3) -- is otherwise unreachable out of the box.
+#
+#  WHAT: idempotently create an ACTIVE (cistatus=4), GTC-accepted `contact`
+#  for MASTERADMIN (=${W5BASE_ADMIN}) and link the `useraccount` login row to
+#  it. `base::user` maps to the `contact` table and resolves a login via the
+#  useraccount.userid = contact.userid join (mod/base/user.pm), so once the
+#  link + active state exist the kernel loads the user and renders the menu.
+#
+#  WHY THIS IS IN-SCOPE / BACKWARD-COMPATIBLE: this writes ONLY DATA rows into
+#  the framework-owned `contact` and `useraccount` tables -- the very rows the
+#  framework itself writes once a user finishes verification. It does NOT touch
+#  application/kernel code (lib/ mod/ bin/app.pl sbin/) or the schema/DDL (sql/,
+#  table structures). It mirrors the in-scope, runtime-state reconciliation
+#  pattern already used above for the itil/itinvautodisc ordering defect. The
+#  Preserve-Backward-Compatibility rule and AAP 0.6.2 are honored.
+#
+#  SECURITY: the admin account name and derived e-mail are escaped for their
+#  SQL string literals via mysql_escape() (CWE-89); the generated userid is a
+#  pure integer; DB_NAME was identifier-validated in step 1b; the application DB
+#  password is passed via MYSQL_PWD so it never reaches the process list. The
+#  seed uses the least-privileged APPLICATION DB user (as the schema
+#  reconciliation above does), not root.
+#
+#  IDEMPOTENT + SELF-DISABLING: if MASTERADMIN already links an ACTIVE,
+#  GTC-accepted contact, the block is skipped -- a no-op on every container
+#  (re)start and after the app itself has fully activated the account.
+########################################################################
+ADMIN_ACC_SQL="$(mysql_escape "$W5BASE_ADMIN")"
+# The admin's primary e-mail is NOT a secret; it is required non-empty on the
+# contact record. It is overridable via the optional W5BASE_ADMIN_EMAIL env
+# (documented in .env.example) and otherwise defaults to a stable dev value.
+: "${W5BASE_ADMIN_EMAIL:=${W5BASE_ADMIN}@w5base.local}"
+ADMIN_EMAIL_SQL="$(mysql_escape "$W5BASE_ADMIN_EMAIL")"
+
+seed_needed="$(MYSQL_PWD="$DB_APP_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_APP_USER" -N -B "$DB_NAME" \
+  -e "SELECT COUNT(*) FROM useraccount ua JOIN contact c ON c.userid=ua.userid \
+      WHERE ua.account='${ADMIN_ACC_SQL}' AND c.cistatus=4 \
+        AND c.gtcack IS NOT NULL AND c.gtcack<>''" 2>/dev/null || echo 0)"
+case "$seed_needed" in ''|*[!0-9]*) seed_needed=0 ;; esac
+
+if [ "$seed_needed" -eq 0 ]; then
+  log "seeding MASTERADMIN '$W5BASE_ADMIN' so first login reaches the main menu ..."
+  # W5Base id format: unix-time concatenated with a 4-digit counter, mirroring
+  # sbin/W5Server's rpcGetUniqueId (sprintf('%d%04d',time,counter)). Only one id
+  # is ever generated because this block self-disables after the first seed.
+  ADMIN_UID="$(date +%s)0001"
+  case "$ADMIN_UID" in ''|*[!0-9]*) die "internal error: generated admin userid '$ADMIN_UID' is not numeric" ;; esac
+  # A single transaction-free batch: create the active, GTC-accepted contact,
+  # then UPSERT the useraccount login row to point at it (account is the PK, so
+  # ON DUPLICATE KEY relinks an existing first-login-created row in place).
+  MYSQL_PWD="$DB_APP_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_APP_USER" "$DB_NAME" <<SQL || die "MASTERADMIN seed failed"
+INSERT INTO contact
+   (userid, fullname, givenname, surname, email, cistatus, usertyp,
+    gtcack, gtctxt, options, secstate, lang,
+    createdate, modifydate, createuser, modifyuser, editor, realeditor, timezone)
+ VALUES
+   (${ADMIN_UID}, 'W5Base Administrator', 'W5Base', 'Administrator',
+    '${ADMIN_EMAIL_SQL}', 4, 'user',
+    NOW(), 'accepted by docker/entrypoint.sh dev-environment seed', '', 2, 'en',
+    NOW(), NOW(), ${ADMIN_UID}, ${ADMIN_UID}, '${ADMIN_ACC_SQL}', '${ADMIN_ACC_SQL}', 'CET');
+INSERT INTO useraccount (account, userid, createdate)
+ VALUES ('${ADMIN_ACC_SQL}', ${ADMIN_UID}, NOW())
+ ON DUPLICATE KEY UPDATE userid=VALUES(userid);
+SQL
+  log "MASTERADMIN '$W5BASE_ADMIN' seeded (userid=$ADMIN_UID, active, GTC-accepted) -> first login lands on /w5base/auth/base/menu/root"
+else
+  log "MASTERADMIN '$W5BASE_ADMIN' already linked to an active account; skipping seed (idempotent)"
+fi
 
 ########################################################################
 # 6. Start the persistent W5Server control plane (daemonizes, self-drops
