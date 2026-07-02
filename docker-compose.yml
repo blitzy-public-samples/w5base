@@ -1,0 +1,186 @@
+# =============================================================================
+# W5Base / Darwin — Containerized Local Development Environment (orchestration)
+# -----------------------------------------------------------------------------
+# NET-NEW, purely additive artifact (AAP §0.5.1 Group 1, §0.6.1). This file is
+# the single entry point for the "one command" developer onboarding the feature
+# promises. It changes NO application code; it only references the Dockerfile,
+# the .env file (from .env.example), and docker/mysql/my.cnf.
+#
+# ONE-COMMAND STARTUP
+#   1. cp .env.example .env         # then edit .env and replace every change-me-*
+#   2. docker compose up --build    # builds the app image and starts the stack
+#
+# WHAT COMES UP
+#   * db      — MySQL 8.0 (pinned) holding the `w5base` schema and app DB user.
+#   * w5base  — Debian 12 + Apache (prefork MPM) + mod_perl2, built from the
+#               local Dockerfile. Its entrypoint (docker/entrypoint.sh) renders
+#               /etc/w5base/*.conf from .env, provisions the DB with modern
+#               CREATE USER / GRANT, builds the schema non-interactively via
+#               `sbin/W5Event ... TableVersionCheck`, starts the persistent
+#               `sbin/W5Server` control plane, and finally runs Apache in the
+#               foreground as the container's main process.
+#
+# SUCCESS SIGNAL
+#   After startup, the W5Base main menu renders at:
+#       ${W5BASE_BASE_URL}/w5base/auth/base/menu/root      (default :8080)
+#   The mandatory smoke test (tests/smoke/w5base_smoke_test.sh) asserts this
+#   plus the other three health signals (W5Server up, W5InstallCheck healthy,
+#   TableVersionCheck clean) against the running stack.
+#
+# HARD RULES honored here
+#   * Health-gated ordering (AAP §0.2.2, §0.7 Reliability): the app service waits
+#     for the DB to be *healthy* (ready), not merely *started*. This is the
+#     single most important reliability control — without it the entrypoint's
+#     TableVersionCheck races an uninitialized database and fails intermittently.
+#   * Pinned image tags (mysql:8.0 here; the local Dockerfile pins debian:12) for
+#     reproducibility — deliberately UNLIKE the out-of-scope contrib container,
+#     which tracks a floating `mariadb:latest` tag.
+#   * NO hardcoded secrets (AAP §0.7): every credential is supplied at runtime
+#     from `.env` via `env_file:` (the mechanism .env.example itself prescribes).
+#     Env references inside the healthcheck shell are escaped as `$$VAR` so
+#     Compose does not interpolate them at parse time — they are expanded by the
+#     db container's own shell from its own environment.
+#
+# The obsolete top-level `version:` key is intentionally omitted: Docker Compose
+# v2 ignores it and warns when it is present.
+# =============================================================================
+
+services:
+
+  # ===========================================================================
+  # db — database service backing dbi:mysql:database=w5base;host=db.
+  # ===========================================================================
+  # WHY the service name is `db`: the application reaches the database by this
+  # Compose service name over the project's default network (see W5BASE_DSN in
+  # .env, which sets host=db, NOT localhost). docker/entrypoint.sh also derives
+  # DB_HOST=db from that DSN. Renaming this service REQUIRES updating W5BASE_DSN.
+  #
+  # WHY mysql:8.0 (pinned, never :latest): a reproducible, canonical environment
+  # (AAP §0.3.1). MariaDB 10.4+ (also pinned, e.g. `mariadb:10.11`) is a fully
+  # supported alternative and is what the base environment was validated against;
+  # both images ship the `mysqladmin` client the healthcheck uses (on MariaDB it
+  # is a symlink to `mariadb-admin`). No `command:` auth-plugin override is set,
+  # so this file stays portable across both engines: Debian 12's DBD::mysql
+  # (libmariadb3) authenticates fine against mysql:8.0's default plugin.
+  db:
+    image: mysql:8.0
+
+    # All DB names/credentials come from .env (never hardcoded). On first start
+    # the official image consumes MYSQL_ROOT_PASSWORD / MYSQL_DATABASE (=w5base)
+    # / MYSQL_USER (=w5base) / MYSQL_PASSWORD to create the schema and the app
+    # user with modern CREATE USER / GRANT — superseding the old README's
+    # `INSERT INTO user` recipe (README.txt L145-L170). MYSQL_PASSWORD MUST equal
+    # W5BASE_DB_PASSWORD so W5Base can then authenticate as the app user.
+    env_file: .env
+
+    volumes:
+      # Persist /var/lib/mysql so the schema built by TableVersionCheck on first
+      # `up` survives `docker compose down`/recreate (named volume `db_data`).
+      - db_data:/var/lib/mysql
+      # MySQL server timeout tuning (net_read_timeout / net_write_timeout /
+      # wait_timeout). It prevents "Lost connection to MySQL server during query"
+      # for W5Base's long direct queries and for idle mod_perl / Apache::DBI
+      # pooled connections (README.txt L490-L497). MySQL and MariaDB both
+      # auto-include /etc/mysql/conf.d/*.cnf; mounted READ-ONLY (no secrets here).
+      - ./docker/mysql/my.cnf:/etc/mysql/conf.d/w5base.cnf:ro
+
+    # THE HEALTH GATE (AAP §0.2.2). The app service's `depends_on: condition:
+    # service_healthy` keys off THIS probe. A fully authenticated TCP ping proves
+    # the server is not merely started but actually accepting real connections:
+    #   * -h 127.0.0.1 forces TCP (the same path the app uses), so the probe does
+    #     NOT pass against the socket-only, --skip-networking temporary server the
+    #     mysql image runs during first-time initialization (which would let the
+    #     app start too early). Using `localhost` (a unix socket) risks exactly
+    #     that false-positive.
+    #   * MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" performs a real authenticated round
+    #     trip while keeping the password OUT of the process list / argv. The
+    #     `$$` escaping stops Compose interpolating at parse time; the db
+    #     container's shell expands the single-`$` form from its own environment.
+    #   * start_period: 60s absorbs first-boot initialization (data dir + schema +
+    #     user creation) before failures begin counting against `retries`.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -u root --silent'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+    # The DB port is intentionally NOT published to the host: the app reaches it
+    # in-network at db:3306. To inspect the database from a host client during
+    # development, uncomment the mapping below (host:container).
+    # ports:
+    #   - "3306:3306"
+
+    # Keep the DB running across host reboots/crashes during development.
+    restart: unless-stopped
+
+  # ===========================================================================
+  # w5base — application service (Debian 12 + Apache prefork + mod_perl2).
+  # ===========================================================================
+  w5base:
+    # Build from the repository's Dockerfile. The source tree is COPYed INTO the
+    # image (see Dockerfile) rather than bind-mounted, so the environment is
+    # deterministic: the vendored "mandatory" Perl modules compiled at build time
+    # and the runtime directories baked by the image are never shadowed by a host
+    # mount, and the build honors .dockerignore (excludes .git, contrib/, .env,
+    # large binary docs). TRADE-OFF: editing repo files on the host requires a
+    # rebuild — the correct posture for a reproducible validation environment. To
+    # iterate on source live instead, add `- .:/opt/w5base` under `volumes:` here,
+    # accepting reduced determinism and that `docker compose build` may be needed
+    # after Dockerfile / dependency / config-template changes.
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # The entrypoint and the rendered /etc/w5base/*.conf files read the full
+    # W5BASE_* + MYSQL_* set from here: W5BASE_DSN, W5BASE_DB_PASSWORD,
+    # W5BASE_ADMIN, W5BASE_ADMIN_PASSWORD, W5BASEINSTDIR, W5BASESRVUSER,
+    # W5BASE_BASE_URL, W5BASE_OPERATION_MODE (and the MYSQL_* values used for
+    # provisioning). Never hardcoded — this is the same .env the db service loads.
+    env_file: .env
+
+    # HEALTH-GATED STARTUP (AAP §0.2.2, §0.7 Reliability). Do NOT start the app
+    # until the database reports healthy. Plain `depends_on` only waits for the
+    # container to *start*, which lets the entrypoint's TableVersionCheck race an
+    # uninitialized DB and fail with connection-refused. `service_healthy` binds
+    # to the db healthcheck above (the entrypoint additionally re-checks DB
+    # readiness as defence-in-depth).
+    depends_on:
+      db:
+        condition: service_healthy
+
+    # PORT MAPPING — host:container. Apache listens on container port 80
+    # (Dockerfile `EXPOSE 80`). The HOST port MUST match the port embedded in
+    # W5BASE_BASE_URL (.env default http://localhost:8080), because the main menu
+    # is reached at ${W5BASE_BASE_URL}/w5base/auth/base/menu/root. If you change
+    # this host port, change W5BASE_BASE_URL to match (and vice versa).
+    ports:
+      - "8080:80"
+
+    # Restart during development unless explicitly stopped. NOTE: this single
+    # container runs BOTH the persistent sbin/W5Server control plane AND Apache —
+    # the entrypoint starts W5Server, then exec's Apache as the main process — so
+    # Compose only needs to publish the HTTP port above. Application-level health
+    # (menu renders, W5InstallCheck, TableVersionCheck) is asserted by
+    # tests/smoke/w5base_smoke_test.sh rather than by a Compose healthcheck.
+    restart: unless-stopped
+
+# =============================================================================
+# Named volumes.
+# -----------------------------------------------------------------------------
+# db_data persists /var/lib/mysql so the schema built on first `up` survives
+# restarts and recreations.
+#
+# We deliberately do NOT declare volumes for /etc/w5base or /var/log/w5base: the
+# entrypoint re-renders the three *.conf files and the htpasswd idempotently from
+# .env on every (re)start (AAP guidance), so persisting them would only risk
+# masking later .env changes. Keeping them ephemeral is simpler and safer.
+#
+# No explicit `networks:` block is declared: Compose places both services on the
+# project's default bridge network, where they resolve each other by service name
+# (`db`, `w5base`) — which is exactly why W5BASE_DSN points its host at `db`.
+# =============================================================================
+volumes:
+  db_data:
