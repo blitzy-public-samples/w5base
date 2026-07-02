@@ -24,8 +24,9 @@
 #   * Oracle (DBD::Oracle) and LDAP (Net::LDAP) are intentionally EXCLUDED —
 #     loading both in one process is a documented segfault hazard, and neither
 #     is part of this minimal dev/validation base.
-#   * The out-of-scope contrib/docker/w5base-ol9-runtime/ asset (OracleLinux +
-#     mod_fcgid) is NOT used, referenced, or copied here.
+#   * The image copies ONLY the application source tree (see the explicit COPY
+#     directives below), so VCS metadata, local env files, large binary
+#     handbooks, and unrelated top-level assets never enter any image layer.
 # =============================================================================
 
 # --- Base image: pinned for a reproducible environment -----------------------
@@ -128,20 +129,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libcrypt-openssl-x509-perl \
       libparams-validate-perl \
       libjson-perl \
+      # -- W5InstallCheck Pass-1 modules provided as reliable Debian packages --
+      #    sbin/W5InstallCheck's low-level Pass 1 hard-fails (exit 1) if ANY of
+      #    these modules is missing, so they are installed from distro packages
+      #    (each verified present + loadable on bookworm) rather than best-effort
+      #    source builds that could let the image build while the check later fails:
+      #      Data::HexDump                          <- libdata-hexdump-perl
+      #      DateTime::Set / ::Span / ::SpanSet     <- libdatetime-set-perl
+      #      Spreadsheet::WriteExcel / ::Big        <- libspreadsheet-writeexcel-perl
+      #      Spreadsheet::ParseExcel / ::SaveParser <- libspreadsheet-parseexcel-perl
+      #      Object::MultiType                      <- libobject-multitype-perl
+      #      Mail::Internet                         <- libmailtools-perl
+      libdata-hexdump-perl \
+      libdatetime-set-perl \
+      libspreadsheet-writeexcel-perl \
+      libspreadsheet-parseexcel-perl \
+      libobject-multitype-perl \
+      libmailtools-perl \
       # -- INTENTIONALLY OMITTED ----------------------------------------------
       #    * libnet-ldap-perl / DBD::Oracle + Instant Client — Oracle & LDAP are
       #      out of scope for this base (segfault-together hazard, README L490+).
-      #    * libdigest-sha1-perl — removed from Debian 12 (obsolete); the one
-      #      kernel reference to Digest::SHA1 is provided via cpanm below.
+      #    * libdigest-sha1-perl — not packaged on Debian 12. Digest::SHA1 IS a
+      #      W5InstallCheck Pass-1 requirement, so it is installed fail-fast from
+      #      CPAN below (never treated as optional).
     && rm -rf /var/lib/apt/lists/*
 
-# --- Digest::SHA1 (optional; not packaged on Debian 12) ----------------------
-# lib/DBIx/MyServer.pm references Digest::SHA1 and it appears in W5InstallCheck's
-# OPTIONAL module set (lib/UUID/Tiny.pm falls back to core Digest::SHA). We add
-# it via CPAN to match the verified working environment. Best-effort: a failure
-# here must NOT break the build, because the module is strictly optional.
-RUN cpanm --notest --quiet Digest::SHA1 \
-      || echo "WARN: optional Digest::SHA1 not installed (safe to ignore)"
+# --- Digest::SHA1 (REQUIRED; not packaged on Debian 12) ----------------------
+# Digest::SHA1 is in sbin/W5InstallCheck's Pass-1 low-level module list, which
+# hard-fails (exit 1) if it is absent — so it is NOT optional. Debian 12 no
+# longer ships libdigest-sha1-perl, so we install it from CPAN and FAIL THE
+# BUILD if that install fails (no best-effort masking that would let the image
+# build while W5InstallCheck later fails).
+RUN cpanm --notest --quiet Digest::SHA1
 
 # =============================================================================
 # Apache module + MPM configuration.
@@ -194,11 +213,31 @@ RUN set -eux; \
 
 # =============================================================================
 # Application source placement.
-# COPY the build context to ${W5BASEINSTDIR} (the .dockerignore excludes .git,
-# contrib/, secrets, and large binary docs). Ownership is set to w5base:daemon
-# so the service account owns its own install tree. No copied file is modified.
+# Copy ONLY the application source tree that the runtime and build need, each
+# path owned by the w5base:daemon service account. Enumerating the directories
+# explicitly (instead of `COPY . `) keeps VCS metadata, local env files (which
+# may hold real secrets), large binary handbooks, and unrelated top-level trees
+# OUT of every image layer — with no dependency on an external ignore file. No
+# copied file is modified. What each path is for:
+#   bin lib mod sbin sql etc -> Perl kernel, data-object modules, shell entry
+#                               points, schema scripts, and the framework config
+#                               defaults (etc/w5base/default.conf) that the
+#                               rendered /etc/w5base configs inherit
+#   skin static              -> assets required for the main menu to render
+#   docker                   -> entrypoint + config templates used at runtime
+#   dependence               -> vendored "mandatory" Perl modules built below
 # =============================================================================
-COPY --chown=w5base:daemon . ${W5BASEINSTDIR}
+COPY --chown=w5base:daemon bin/        ${W5BASEINSTDIR}/bin/
+COPY --chown=w5base:daemon lib/        ${W5BASEINSTDIR}/lib/
+COPY --chown=w5base:daemon mod/        ${W5BASEINSTDIR}/mod/
+COPY --chown=w5base:daemon sbin/       ${W5BASEINSTDIR}/sbin/
+COPY --chown=w5base:daemon sql/        ${W5BASEINSTDIR}/sql/
+COPY --chown=w5base:daemon etc/        ${W5BASEINSTDIR}/etc/
+COPY --chown=w5base:daemon skin/       ${W5BASEINSTDIR}/skin/
+COPY --chown=w5base:daemon static/     ${W5BASEINSTDIR}/static/
+COPY --chown=w5base:daemon docker/     ${W5BASEINSTDIR}/docker/
+COPY --chown=w5base:daemon dependence/ ${W5BASEINSTDIR}/dependence/
+COPY --chown=w5base:daemon README.txt README.ConfigParameters.txt README.AppCom.txt W5Server.README.txt LICENSE ${W5BASEINSTDIR}/
 
 # =============================================================================
 # Vendored "mandatory" Perl modules — compiled at build time from
@@ -206,36 +245,37 @@ COPY --chown=w5base:daemon . ${W5BASEINSTDIR}
 # are never inspected; this is a build-step path only. `umask 022` matches the
 # README's build recipe.
 #
-# CRITICAL builds fail the image on error; best-effort builds are tolerated:
-#   * RPC-Smart — the transport for the W5Server control plane and `use`d by
-#     sbin/W5Event & sbin/CreateDatabaseUser. Without it nothing starts.
-#   * Env-C     — Env::C is in W5InstallCheck's REQUIRED module set.
-#   * DateTime-Set / Data-HexDump / Spreadsheet-WriteExcel / HTML-TagFilter —
-#     optional at runtime; tolerated so a single legacy build hiccup cannot
-#     block the whole environment.
-#   * IPC-Smart — UNUSED by the kernel and known to fail on modern gcc/glibc;
-#     attempted for completeness but never allowed to fail the build.
+# ONLY the modules that are genuinely required AND are not available as a
+# reliable Debian package are built here, and EVERY one FAILS THE BUILD on error
+# (no best-effort masking that could let the image build while sbin/W5InstallCheck
+# later fails):
+#   * RPC-Smart      — transport for the W5Server control plane; `use`d by
+#                      sbin/W5Event & sbin/CreateDatabaseUser and listed in
+#                      W5InstallCheck Pass 1. Without it nothing starts.
+#   * Env-C          — Env::C is in W5InstallCheck's required module set.
+#   * HTML-TagFilter — HTML::TagFilter is marked MANDATORY by
+#                      mod/faq/ext/InstallCheck.pm and is not packaged on Debian 12.
+#
+# Deliberately NOT built here:
+#   * DateTime-Set / Data-HexDump / Spreadsheet-WriteExcel — also W5InstallCheck
+#     requirements, but installed above from reliable Debian packages
+#     (libdatetime-set-perl / libdata-hexdump-perl / libspreadsheet-writeexcel-perl),
+#     so no source build is needed.
+#   * IPC-Smart — unused by the kernel, absent from every W5InstallCheck probe
+#     (the check exits 0 without it), and does not compile on a modern gcc/glibc
+#     toolchain. Building it would add only a guaranteed-failing step, so it is
+#     omitted entirely rather than tolerated as a masked failure.
 # =============================================================================
 RUN set -eux; \
     chmod 0755 "${W5BASEINSTDIR}/docker/entrypoint.sh"; \
     cd "${W5BASEINSTDIR}/dependence/mandatory"; \
     umask 022; \
-    # -- CRITICAL: RPC::Smart (W5Server control-plane transport) --------------
+    # -- RPC::Smart (W5Server control-plane transport; Pass-1 required) -------
     ( cd RPC-Smart && perl Makefile.PL && make && make install ); \
-    # -- REQUIRED: Env::C (W5InstallCheck mandatory module) ------------------
+    # -- Env::C (W5InstallCheck required module) -----------------------------
     ( tar -xzf Env-C-*.tar.gz && cd Env-C-*/ && perl Makefile.PL && make && make install ); \
-    # -- Best-effort optional modules (never block the build) ----------------
-    ( tar -xzf DateTime-Set-*.tar.gz && cd DateTime-Set-*/ && perl Makefile.PL && make && make install ) \
-        || echo "WARN: optional DateTime-Set build skipped"; \
-    ( tar -xzf Data-HexDump-*.tar.gz && cd Data-HexDump-*/ && perl Makefile.PL && make && make install ) \
-        || echo "WARN: optional Data-HexDump build skipped"; \
-    ( tar -xzf Spreadsheet-WriteExcel-*.tar.gz && cd Spreadsheet-WriteExcel-*/ && perl Makefile.PL && make && make install ) \
-        || echo "WARN: optional Spreadsheet-WriteExcel build skipped"; \
-    ( tar -xzf HTML-TagFilter-*.tar.gz && cd HTML-TagFilter-*/ && perl Makefile.PL && make && make install ) \
-        || echo "WARN: optional HTML-TagFilter build skipped"; \
-    # -- IPC-Smart: unused + known to fail on modern toolchains --------------
-    ( cd IPC-Smart && perl Makefile.PL && make && make install ) \
-        || echo "WARN: IPC-Smart skipped (UNUSED; expected to fail on modern gcc)"
+    # -- HTML::TagFilter (mandatory per mod/faq/ext/InstallCheck.pm) ----------
+    ( tar -xzf HTML-TagFilter-*.tar.gz && cd HTML-TagFilter-*/ && perl Makefile.PL && make && make install )
 
 # --- Network + startup contract ----------------------------------------------
 # Apache listens on 80 inside the container; the host port mapping lives in

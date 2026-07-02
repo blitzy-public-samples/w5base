@@ -443,7 +443,13 @@ W5BaseOperationMode = test | automodify | online | normal |
 > privileges themselves are also tightened so that write operations cannot occur.
 
 The container exposes this setting through the `W5BASE_OPERATION_MODE`
-environment variable; for local development it is left at the live default.
+environment variable, which `docker/entrypoint.sh` renders **identically** into
+**both** rendered configs — `w5base.conf` (the frontend) and `w5server.conf`
+(the control plane) — thereby satisfying the critical rule above by
+construction. For local development it defaults to **`normal`** (a
+live-operation mode, equivalent to `online` in the table above); the
+repository's `etc/w5base/default.conf` ships `online`. Either live mode works so
+long as the two configs match, which the single-variable rendering guarantees.
 
 ---
 

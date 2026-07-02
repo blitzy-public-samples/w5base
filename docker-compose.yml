@@ -33,8 +33,8 @@
 #     single most important reliability control — without it the entrypoint's
 #     TableVersionCheck races an uninitialized database and fails intermittently.
 #   * Pinned image tags (mysql:8.0 here; the local Dockerfile pins debian:12) for
-#     reproducibility — deliberately UNLIKE the out-of-scope contrib container,
-#     which tracks a floating `mariadb:latest` tag.
+#     reproducibility — explicit tags are used instead of a floating `latest`
+#     tag so the environment stays deterministic across rebuilds.
 #   * NO hardcoded secrets (AAP §0.7): every credential is supplied at runtime
 #     from `.env` via `env_file:` (the mechanism .env.example itself prescribes).
 #     Env references inside the healthcheck shell are escaped as `$$VAR` so
@@ -124,8 +124,9 @@ services:
     # image (see Dockerfile) rather than bind-mounted, so the environment is
     # deterministic: the vendored "mandatory" Perl modules compiled at build time
     # and the runtime directories baked by the image are never shadowed by a host
-    # mount, and the build honors .dockerignore (excludes .git, contrib/, .env,
-    # large binary docs). TRADE-OFF: editing repo files on the host requires a
+    # mount, and the Dockerfile copies only the application source tree (VCS
+    # metadata, local env files, and large binary handbooks stay out of the
+    # image). TRADE-OFF: editing repo files on the host requires a
     # rebuild — the correct posture for a reproducible validation environment. To
     # iterate on source live instead, add `- .:/opt/w5base` under `volumes:` here,
     # accepting reduced determinism and that `docker compose build` may be needed
