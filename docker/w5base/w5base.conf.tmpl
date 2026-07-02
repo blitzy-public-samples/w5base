@@ -1,0 +1,37 @@
+#
+# w5base.conf.tmpl — W5Base application config (TEMPLATE)
+#
+# Rendered by docker/entrypoint.sh (whitelist envsubst) into
+# /etc/w5base/w5base.conf (owner w5base:daemon, mode 0640), then read by the
+# web/app path (bin/app.pl under Apache prefork + mod_perl2) and by the
+# non-interactive schema build (sbin/W5Event -c w5base -s -d -v TableVersionCheck).
+#
+# WHAT is substituted from the environment at render time:
+#   - W5BASE_ADMIN           the admin REMOTE_USER (see MASTERADMIN below)
+#   - W5BASE_OPERATION_MODE  the application operation mode
+# These are the ONLY environment tokens in this template, and both are defined
+# in .env.example. SITENAME and AutoLoadMenuPath are written as LITERALS on
+# purpose: they are NOT provided in .env, so leaving them as placeholders would
+# render EMPTY and break the app identity / landing menu. Their literal values
+# mirror the framework reference etc/w5base/default.conf.
+#
+# WHY the INCLUDE: the data-object DB credentials are never hardcoded here.
+# They live in the shared databases.conf fragment (rendered from
+# docker/w5base/databases.conf.tmpl) and are pulled in via the INCLUDE below —
+# the same convention W5Server uses, so the control plane and the web/app path
+# share one DB definition (README.txt L244; README.ConfigParameters.txt L69).
+#
+# WHY MASTERADMIN matters: the kernel grants the built-in admin group whenever
+# the authenticated REMOTE_USER equals MASTERADMIN, regardless of group
+# membership (README.ConfigParameters.txt L82-86). Keeping MASTERADMIN equal to
+# the htpasswd admin username is what lets first login reach the main menu at
+# /w5base/auth/base/menu/root. The legacy documented default must be changed.
+#
+# Framework defaults inherited from etc/w5base/default.conf are intentionally
+# not restated here; only the non-default keys plus the INCLUDE are set.
+#
+INCLUDE /etc/w5base/databases.conf
+MASTERADMIN="${W5BASE_ADMIN}"
+SITENAME="W5Base"
+AutoLoadMenuPath="MyW5Base"
+W5BaseOperationMode="${W5BASE_OPERATION_MODE}"

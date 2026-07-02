@@ -1,0 +1,17 @@
+#
+# w5server.conf.tmpl — W5Server (control-plane) config (TEMPLATE)
+#
+# Rendered by docker/entrypoint.sh (whitelist envsubst) into
+# /etc/w5base/w5server.conf, then read by: sbin/W5Server -c w5server.
+# W5Server is the persistent TCP process server the web frontend depends on.
+#
+# Pulls DB credentials from the shared databases.conf fragment via INCLUDE.
+# Only W5BASESRVUSER is substituted from the environment (defaults to w5base).
+# All other values are literals mirroring etc/w5base/default.conf.
+#
+INCLUDE /etc/w5base/databases.conf
+W5ServerPort="12833"
+W5ServerUser="${W5BASESRVUSER}"
+W5ServerGroup="daemon"
+W5ServerState="/var/opt/w5base/state"
+W5ServerAllow="127.0.0.1"
