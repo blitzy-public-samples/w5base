@@ -31,8 +31,12 @@
 #   Check 3  Install is healthy ..... sbin/W5InstallCheck reports a healthy
 #                                     install (exit 0).
 #   Check 4  Schema is reconciled ... sbin/W5Event ... TableVersionCheck runs
-#                                     clean with no schema-version errors
-#                                     (exit 0).
+#                                     clean with no schema-version errors --
+#                                     asserted by BOTH its exit code AND the
+#                                     ABSENCE of error markers in its output,
+#                                     because W5Event exits 0 even on a fatal DB
+#                                     outage / failed schema apply (QA FINAL-E
+#                                     Issue #1). Exit code alone is not enough.
 #
 # WHY EACH SIGNAL MATTERS
 # -----------------------
@@ -56,8 +60,13 @@
 #   * TableVersionCheck (Check 4) reconciles the SQL under sql/ against the live
 #     database. It is invoked with `-s -d -v` on purpose: `-s` = serverless (a
 #     running W5Server is not required for this check) and `-v`/`-d` are
-#     required because W5Event closes STDOUT unless verbose/debug is set. Its
-#     exit code is authoritative (0 = clean).
+#     required because W5Event closes STDOUT unless verbose/debug is set.
+#     IMPORTANT: unlike Check 3, W5Event's exit code is NOT authoritative -- it
+#     returns 0 even on a fatal DB-connect / schema-apply failure (QA FINAL-E
+#     Issue #1). So Check 4 asserts BOTH a zero exit code AND the absence of
+#     error markers in the captured output (see tableversion_output_has_errors),
+#     making it a genuine detector of a DB/schema regression rather than a
+#     rubber stamp on a misleading exit code.
 #
 # HOW TO RUN
 # ----------
@@ -160,10 +169,37 @@ parse_w5server_port() {
   fi
 }
 
-# run_self_test: fast, dependency-free regression coverage for the W5ServerPort
-# parser. It is exercised in CI BEFORE the stack is built (see
-# .github/workflows/smoke.yml) so a parser regression is caught immediately
-# instead of silently false-failing a healthy stack.
+# tableversion_output_has_errors: read captured `W5Event ... TableVersionCheck`
+# output on STDIN and return 0 (TRUE) iff it contains any schema/DB error marker.
+#
+# WHY THIS EXISTS (QA FINAL-E Issue #1): sbin/W5Event exits 0 even on FATAL
+# DB-connect / schema-apply failures -- verified directly: with the database
+# down, every `CREATE TABLE` errors, yet W5Event still returns exit 0 with
+# 'msg' => 'OK'. Its exit code is therefore NOT an authoritative "clean schema"
+# signal, so Check 4 must ALSO inspect the output. These markers are exactly
+# what the kernel logs on failure, and are ABSENT from a clean run (a healthy
+# verbose run prints only DEBUG:/INFO: lines and ends with 'msg' => 'OK'):
+#   ERROR                -- the kernel error-log prefix, e.g. "ERROR: Connect(",
+#                           "ERROR: Command 'CREATE TABLE ...'", "ERROR in command:"
+#   Database error       -- a DBI/database failure line
+#   Unknown server host  -- the DB host (compose service 'db') is unreachable
+#   Connect(             -- a failed DataObj DB-connect attempt, "Connect(<db>):"
+#   Line N in file       -- a schema statement failed at sql/<mod>/<file>.sql:N
+# The match is case-SENSITIVE on purpose: the kernel emits UPPERCASE "ERROR", so
+# this never false-fails a clean run that merely mentions a lowercase word like
+# "errors" in an informational line. Reading STDIN (rather than piping into
+# grep) keeps the caller free of the `set -o pipefail` + `grep -q` early-exit
+# race and lets the --self-test cases below drive it with a here-string.
+tableversion_output_has_errors() {
+  grep -qE 'ERROR|Database error|Unknown server host|Connect\(|Line [0-9]+ in file'
+}
+
+# run_self_test: fast, dependency-free regression coverage for the pure helpers
+# that decide a health signal -- the W5ServerPort parser (Check 1) and the
+# TableVersionCheck error-marker detector (Check 4, QA FINAL-E Issue #1). It is
+# exercised in CI BEFORE the stack is built (see .github/workflows/smoke.yml) so
+# a regression in either is caught immediately instead of silently false-failing
+# a healthy stack (parser) or silently false-passing a broken one (detector).
 run_self_test() {
   local failures=0 got
   assert_port() {                    # $1=input  $2=expected  $3=description
@@ -175,7 +211,7 @@ run_self_test() {
       failures=$((failures + 1))
     fi
   }
-  log "=== W5Base smoke-test self-test (W5ServerPort parser) ==="
+  log "=== W5Base smoke-test self-test (W5ServerPort parser + Check 4 error-marker detector) ==="
   # The exact value docker/w5base/w5server.conf.tmpl renders in this environment
   # (the regression that motivated this test):
   assert_port 'W5ServerPort="127.0.0.1:12833"'     '12833' 'rendered host:port line (regression)'
@@ -188,12 +224,38 @@ run_self_test() {
   assert_port 'W5ServerPort="127.0.0.1:"'          ''      'missing port after colon yields none'
   assert_port 'W5ServerPort="70000"'               ''      'out-of-range port yields none'
   assert_port 'W5ServerPort="abc"'                 ''      'non-numeric yields none'
+
+  # ---- Check 4 error-marker detector (QA FINAL-E Issue #1) ------------------
+  # A clean TableVersionCheck run has NO error markers; a DB-down / failed
+  # schema apply DOES -- even though W5Event still exits 0. These cases lock the
+  # detector down so Check 4 can never regress into the original false-pass, and
+  # so it never false-DETECTS a benign lowercase "error" in an informational
+  # line. The samples mirror the actual W5Event output observed in each state.
+  assert_tvc() {                     # $1=sample output  $2=expected(0=has-errors,1=clean)  $3=description
+    if tableversion_output_has_errors <<< "$1"; then got=0; else got=1; fi
+    if [ "$got" = "$2" ]; then
+      log "${PASS_ICON} self-test: $3"
+    else
+      log "${FAIL_ICON} self-test: $3 (detector -> '$got', expected '$2')"
+      failures=$((failures + 1))
+    fi
+  }
+  assert_tvc "DEBUG: ProcessEvent 'TableVersionCheck'
+INFO:  automatic and unattended TableVersionCheck
+DEBUG:   0 base/filemgmt.sql              f:85/proc:85
+DEBUG:             'exitcode' => 0,
+DEBUG:             'msg' => 'OK'"                                        1 'clean output (exit 0, only DEBUG/INFO) has no error markers'
+  assert_tvc "ERROR: Connect(w5base): DBI 'Unknown server host 'db' (-5)'" 0 'DB-down connect failure is detected'
+  assert_tvc "ERROR: Line 27 in file '/opt/w5base/sql/base/filemgmt.sql'"  0 'failed schema apply (Line N in file) is detected'
+  assert_tvc "ERROR: Database error: 'Unknown server host 'db''"          0 'database error line is detected'
+  assert_tvc "INFO: 0 errors found; schema is error-free"                 1 'benign lowercase "error" is NOT a false detection'
+
   log ""
   if [ "$failures" -eq 0 ]; then
-    log "self-test RESULT: all parser cases passed"
+    log "self-test RESULT: all self-test cases passed"
     return 0
   fi
-  log "self-test RESULT: ${failures} parser case(s) FAILED"
+  log "self-test RESULT: ${failures} self-test case(s) FAILED"
   return 1
 }
 
@@ -532,16 +594,43 @@ check_install() {
 }
 
 # =============================================================================
-# Check 4 -- TableVersionCheck reconciles the schema cleanly (exit 0).
+# Check 4 -- TableVersionCheck reconciles the schema cleanly.
+#
+# The exit code is NOT sufficient on its own: sbin/W5Event returns exit 0 even
+# on a FATAL DB-connect / schema-apply failure (QA FINAL-E Issue #1 -- with the
+# database down, every CREATE TABLE errors yet W5Event still exits 0 with
+# 'msg' => 'OK'). So this check captures W5Event's combined output and FAILS on
+# a non-zero exit OR on any error marker in that output (see
+# tableversion_output_has_errors). That makes Check 4 a genuine, independent
+# detector of a DB/schema regression instead of trusting a misleading exit code.
+# sbin/W5Event itself is left untouched (Preserve Backward Compatibility) -- the
+# fix lives entirely in how this test interprets its output.
 # =============================================================================
 check_tableversion() {
   info "Check 4: ${W5BASEINSTDIR}/sbin/W5Event -c ${W5BASE_CONFIG} -s -d -v TableVersionCheck (inside container)"
-  if in_w5base "${W5BASEINSTDIR}/sbin/W5Event" -c "${W5BASE_CONFIG}" -s -d -v TableVersionCheck >/dev/null 2>&1; then
-    record_pass "TableVersionCheck is clean -- schema reconciled with no errors (exit 0)"
-    return 0
+  # Capture W5Event's COMBINED stdout+stderr AND its exit code. The output goes
+  # into the private, mode-0700 CRED_DIR (removed by the cleanup trap, never
+  # world-readable), mirroring how Check 2 stores the menu body. `|| rc=$?`
+  # keeps `set -e` from aborting on a non-zero exit so we can report the signal.
+  local out="${CRED_DIR}/tableversioncheck.out"
+  local rc=0
+  in_w5base "${W5BASEINSTDIR}/sbin/W5Event" -c "${W5BASE_CONFIG}" -s -d -v TableVersionCheck \
+    > "${out}" 2>&1 || rc=$?
+
+  # A non-zero exit is an unambiguous failure.
+  if [ "${rc}" -ne 0 ]; then
+    record_fail "TableVersionCheck failed (W5Event exited ${rc})"
+    return 1
   fi
-  record_fail "TableVersionCheck reported schema-version errors (non-zero exit)"
-  return 1
+  # Exit 0 is NOT proof of success: fail if the output carries error markers
+  # (DB unreachable, a failed schema apply, a "Database error", etc.). This is
+  # the fix for the exit-0-on-DB-down false-pass.
+  if tableversion_output_has_errors < "${out}"; then
+    record_fail "TableVersionCheck reported schema/DB errors despite exit 0 (database unreachable or a schema apply failed) -- W5Event's exit code is not authoritative for a clean schema"
+    return 1
+  fi
+  record_pass "TableVersionCheck is clean -- schema reconciled with no errors (exit 0 and no error markers in output)"
+  return 0
 }
 
 # =============================================================================

@@ -68,6 +68,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       apache2-utils \
       openssl \
       default-mysql-client \
+      # -- HTTP client for the in-container smoke-test main-menu probe ---------
+      #    tests/smoke/w5base_smoke_test.sh Check 2 fetches the main menu with
+      #    curl. In host mode the script uses the HOST's curl, but when it runs
+      #    INSIDE this container (W5BASE_IN_CONTAINER=1, or the documented
+      #    /opt/w5base/tests/... invocation) it needs curl on PATH here, else
+      #    Check 2 cannot run (QA FINAL-E Issue #3). curl also keeps the admin
+      #    credential out of argv via `curl -K <cred-file>`, matching the
+      #    script's secret-safe posture.
+      curl \
       # -- Build toolchain for the vendored "mandatory" Perl modules ----------
       #    perl Makefile.PL && make && make install (XS modules need gcc +
       #    libc6-dev; the perl CORE headers ship with the `perl` package).
@@ -225,6 +234,11 @@ RUN set -eux; \
 #                               rendered /etc/w5base configs inherit
 #   skin static              -> assets required for the main menu to render
 #   docker                   -> entrypoint + config templates used at runtime
+#   tests                    -> the smoke/health-check, so the documented
+#                               in-container invocation
+#                               (W5BASE_IN_CONTAINER=1
+#                               /opt/w5base/tests/smoke/w5base_smoke_test.sh)
+#                               is runnable out of the box (QA FINAL-E Issue #4)
 #   dependence               -> vendored "mandatory" Perl modules built below
 # =============================================================================
 COPY --chown=w5base:daemon bin/        ${W5BASEINSTDIR}/bin/
@@ -236,6 +250,7 @@ COPY --chown=w5base:daemon etc/        ${W5BASEINSTDIR}/etc/
 COPY --chown=w5base:daemon skin/       ${W5BASEINSTDIR}/skin/
 COPY --chown=w5base:daemon static/     ${W5BASEINSTDIR}/static/
 COPY --chown=w5base:daemon docker/     ${W5BASEINSTDIR}/docker/
+COPY --chown=w5base:daemon tests/      ${W5BASEINSTDIR}/tests/
 COPY --chown=w5base:daemon dependence/ ${W5BASEINSTDIR}/dependence/
 COPY --chown=w5base:daemon README.txt README.ConfigParameters.txt README.AppCom.txt W5Server.README.txt LICENSE ${W5BASEINSTDIR}/
 
