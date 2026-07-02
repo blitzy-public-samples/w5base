@@ -7,7 +7,7 @@
 #
 # WHAT THIS SCRIPT DOES
 # ---------------------
-# It asserts the FOUR health signals that together prove the containerized
+# It asserts the FIVE health signals that together prove the containerized
 # W5Base local development environment (see docker-compose.yml, docker/) is
 # actually up and usable after `docker compose up --build`:
 #
@@ -37,6 +37,18 @@
 #                                     because W5Event exits 0 even on a fatal DB
 #                                     outage / failed schema apply (QA FINAL-E
 #                                     Issue #1). Exit code alone is not enough.
+#   Check 5  Menu is NAVIGABLE ...... a GENERATED menu link carries the /w5base
+#                                     app-path prefix AND resolves (HTTP 200).
+#                                     Check 2 proves the root frameset RENDERS,
+#                                     but the acceptance run showed the root can
+#                                     render while every generated nav link is
+#                                     still broken: with EventJobBaseUrl empty the
+#                                     kernel emits links WITHOUT the /w5base
+#                                     segment (e.g. /auth/base/menu/msel/...) and
+#                                     every click 404s. This check extracts a real
+#                                     generated link and follows it, so "menu
+#                                     renders" is upgraded to "menu WORKS"
+#                                     (QA FINAL menu-404 acceptance gate).
 #
 # WHY EACH SIGNAL MATTERS
 # -----------------------
@@ -67,6 +79,14 @@
 #     error markers in the captured output (see tableversion_output_has_errors),
 #     making it a genuine detector of a DB/schema regression rather than a
 #     rubber stamp on a misleading exit code.
+#   * Menu navigability (Check 5) is the difference between "the menu drew" and
+#     "the menu works". The acceptance definition is a developer reaching a
+#     logged-in, FUNCTIONING main menu -- not merely a root frameset. Because the
+#     kernel derives every menu-tree href and the user-count probe from the
+#     EventJobBaseUrl config value, an empty value silently strips the /w5base
+#     app-path segment and turns every click into a 404 while Check 2 still
+#     passes. Check 5 follows a real generated link so this class of defect can
+#     never slip through the gate again (QA FINAL menu-404 acceptance gate).
 #
 # HOW TO RUN
 # ----------
@@ -83,13 +103,13 @@
 #
 # The script is fully ENV-DRIVEN and reads every credential/endpoint from the
 # environment (or an optional local .env) -- it NEVER hardcodes secrets and it
-# never embeds the legacy default credentials. It runs all four checks, prints
+# never embeds the legacy default credentials. It runs all five checks, prints
 # a clear per-check PASS/FAIL line plus a final summary, and exits non-zero if
 # ANY check fails.
 #
 # EXIT CODES
 # ----------
-#   0  all four checks passed
+#   0  all five checks passed
 #   1  one or more checks failed
 #   2  configuration error (a required secret/variable is unset)
 # =============================================================================
@@ -300,6 +320,10 @@ W5BASE_CONFIG="${W5BASE_CONFIG:-w5server}"         # config name for -c (W5Insta
 W5BASE_SERVER_CONFIG="${W5BASE_SERVER_CONFIG:-w5server}"  # config that defines W5ServerPort
 W5BASE_BASE_URL="${W5BASE_BASE_URL:-http://localhost:8080}"   # host-facing URL
 MENU_PATH="/w5base/auth/base/menu/root"
+# Check 5 GETs this GENERATED menu-tree frame and asserts the in-app links it
+# emits carry the /w5base app-path prefix and actually resolve (HTTP 200). See
+# check_generated_menu_link for the rationale (QA menu-404 acceptance gate).
+MENU_FRAME_PATH="/w5base/auth/base/menu/menuframe/MyW5Base"
 DEFAULT_W5SERVER_PORT="12833"                      # this env's w5server.conf value (code default is 4711)
 HTTP_RETRIES="${W5BASE_HTTP_RETRIES:-10}"          # bounded warm-up retries for Check 2
 HTTP_RETRY_DELAY="${W5BASE_HTTP_RETRY_DELAY:-3}"   # seconds between retries
@@ -634,14 +658,119 @@ check_tableversion() {
 }
 
 # =============================================================================
-# Run all four checks. `if <check>; then` protects each from `set -e` so a
+# Check 5 -- Generated in-app menu links carry the /w5base app-path prefix AND
+# resolve (HTTP 200) -- i.e. the menu is actually NAVIGABLE, not just rendered.
+#
+# WHY this is a distinct, mandatory check (QA FINAL acceptance gate / Issue #1):
+# Check 2 proves the root menu FRAMESET renders, but the acceptance run showed
+# the root frame can render HTTP 200 while EVERY generated navigation link is
+# still broken. The read-only kernel (mod/base/menu.pm) builds the left-hand
+# menu-tree hrefs and the live "current user count" JSONP probe from the config
+# value EventJobBaseUrl. When that value is EMPTY the kernel normalizes it to
+# "/", so the links render WITHOUT the "/w5base" app-path segment (e.g.
+# "/auth/base/menu/msel/MyW5Base/userenv") -- and because Apache only mounts the
+# app under "/w5base/..." (docker/apache/w5base.conf), clicking any such link
+# 404s. A status-only or root-frameset-only assertion is blind to this: the root
+# renders fine while navigation is dead. This check closes that gap.
+#
+# HOW: fetch a GENERATED menu-tree frame (MENU_FRAME_PATH), extract a real
+# generated menu link exactly as the kernel emitted it (stripping the historic
+# leading-space WebSSO hack in the href), then (1) ASSERT the link's PATH begins
+# with the app segment "/<app>/auth/" -- a bare "/auth/..." is precisely the QA
+# 404 defect and FAILS the check -- and (2) FOLLOW the link and ASSERT HTTP 200.
+# The link path is always re-based onto the same origin Check 2 uses, so the
+# check works whether EventJobBaseUrl is the path-only "/w5base/" form or the
+# full "http://host/w5base/" form. No application code is touched: this only
+# reads what the running app generated (Preserve Backward Compatibility).
+# =============================================================================
+check_generated_menu_link() {
+  # Same origin selection as Check 2: container -> :80, host -> published URL.
+  local base
+  if [ "${IN_CONTAINER}" -eq 1 ]; then
+    base="${W5BASE_INTERNAL_URL:-http://localhost:80}"
+  else
+    base="${W5BASE_BASE_URL}"
+  fi
+  # The app-path segment the generated auth links MUST carry (derived from
+  # MENU_PATH's first segment, e.g. "w5base"), so this stays correct if the
+  # mount path is ever changed in one place.
+  local app_seg
+  app_seg="$(printf '%s' "${MENU_PATH#/}" | cut -d/ -f1)"
+  local frame_url="${base%/}${MENU_FRAME_PATH}"
+  info "Check 5: GET ${frame_url} then assert a generated menu link carries '/${app_seg}/auth/' and returns 200"
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    record_fail "generated-link check needs curl or wget, neither found on PATH"
+    return 1
+  fi
+
+  # Fetch the generated navigation frame into the private, mode-700 CRED_DIR
+  # (removed by the cleanup trap, never world-readable) -- same posture as Check 2.
+  local frame="${CRED_DIR}/menuframe.html"
+  local code
+  code="$(fetch_url "${frame_url}" "${frame}")"
+  if [ "${code}" != "200" ]; then
+    record_fail "could not fetch the generated menu frame (HTTP ${code}) at ${frame_url}"
+    return 1
+  fi
+
+  # Extract the first generated menu-tree link (a base/menu/msel entry -- the
+  # exact family the QA click-through exercised). grep keeps the raw href value,
+  # which begins with the kernel's leading-space WebSSO hack; strip href="..."
+  # wrapping and any leading whitespace to recover the link the browser would use.
+  local raw link
+  raw="$(grep -oE 'href="[^"]*base/menu/msel[^"]*"' "${frame}" | head -n 1)"
+  if [ -z "${raw}" ]; then
+    record_fail "no generated menu link (base/menu/msel) found in the menu frame at ${frame_url} -- menu tree empty?"
+    return 1
+  fi
+  link="$(printf '%s' "${raw}" | sed -E 's/^href="//; s/"$//; s/^[[:space:]]+//')"
+
+  # Reduce the link to its PATH: full-URL forms (http://host/PATH) are stripped
+  # to "/PATH" so the assertion and the follow-up GET are host/port agnostic.
+  local path
+  case "${link}" in
+    http://*|https://*) path="/$(printf '%s' "${link}" | sed -E 's#^[a-z]+://[^/]+/##')" ;;
+    *)                  path="${link}" ;;
+  esac
+
+  # ASSERT (1): the generated path carries the "/<app>/auth/" prefix. A bare
+  # "/auth/..." path is the QA menu-404 defect (missing /<app> segment) -> FAIL.
+  case "${path}" in
+    /"${app_seg}"/auth/*) : ;;  # correct -- link carries the app-path prefix
+    /auth/*)
+      record_fail "generated menu link '${path}' is root-relative and MISSING the '/${app_seg}' app-path prefix -- this is the QA menu-404 defect; set EventJobBaseUrl in the app config so links resolve under /${app_seg}"
+      return 1 ;;
+    *)
+      record_fail "generated menu link has an unexpected path '${path}' (neither '/${app_seg}/auth/...' nor a bare '/auth/...') at ${frame_url}"
+      return 1 ;;
+  esac
+
+  # ASSERT (2): the generated link actually resolves. Re-base the PATH onto the
+  # same origin and GET it -- this is the programmatic equivalent of the QA
+  # browser click-through that previously 404'd.
+  local nav_url="${base%/}${path}"
+  local nav_body="${CRED_DIR}/menu_nav_body.html"
+  local nav_code
+  nav_code="$(fetch_url "${nav_url}" "${nav_body}")"
+  if [ "${nav_code}" = "200" ]; then
+    record_pass "generated menu link resolves: '${path}' carries the '/${app_seg}' app path and returns HTTP 200 (navigation works)"
+    return 0
+  fi
+  record_fail "generated menu link '${path}' did NOT return 200 (HTTP ${nav_code}) at ${nav_url} -- navigation is broken"
+  return 1
+}
+
+# =============================================================================
+# Run all five checks. `if <check>; then` protects each from `set -e` so a
 # single failure does not abort the run -- we want every signal reported.
 # =============================================================================
 log "=== W5Base environment smoke test ==="
-if check_w5server_up;   then :; fi
-if check_main_menu;     then :; fi
-if check_install;       then :; fi
-if check_tableversion;  then :; fi
+if check_w5server_up;        then :; fi
+if check_main_menu;          then :; fi
+if check_install;            then :; fi
+if check_tableversion;       then :; fi
+if check_generated_menu_link; then :; fi
 
 log ""
 log "--- summary ---"

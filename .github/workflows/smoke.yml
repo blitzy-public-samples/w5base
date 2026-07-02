@@ -30,7 +30,7 @@
 #   4. A light, bounded readiness wait. Intentionally light because the smoke
 #      test itself retries the HTTP main-menu check ~10x; this only gives the
 #      entrypoint a head start and surfaces an early hard failure.
-#   5. Run the mandatory smoke test. It is the gate: it asserts the FOUR health
+#   5. Run the mandatory smoke test. It is the gate: it asserts the FIVE health
 #      signals against the running stack and a non-zero exit fails the job.
 #        (1) W5Server (persistent TCP control plane) is up -- a running Apache
 #            alone is insufficient because the Apache spare processes talk to
@@ -40,6 +40,9 @@
 #            user-visible acceptance signal), via HTTP Basic auth.
 #        (3) sbin/W5InstallCheck reports a healthy install (exit 0).
 #        (4) TableVersionCheck reconciles the schema cleanly (exit 0).
+#        (5) The menu is NAVIGABLE: a generated menu link carries the /w5base
+#            app-path prefix AND resolves (HTTP 200). Guards the menu-404 class
+#            of defect where the root frameset renders but every link is broken.
 #      Exit 1 = a health signal failed; exit 2 = missing config.
 #   6. Always tear the stack down (docker compose down -v) so the runner stays
 #      clean; on failure, dump logs/ps to aid debugging.
@@ -148,13 +151,13 @@ jobs:
       #    From the host it drives the app container via
       #    `docker compose exec -T w5base ...` (the -T flag is required for
       #    non-interactive CI). A non-zero exit fails the job automatically.
-      - name: Run W5Base smoke test (asserts the four health signals)
+      - name: Run W5Base smoke test (asserts the five health signals)
         run: |
           chmod +x ./tests/smoke/w5base_smoke_test.sh
           ./tests/smoke/w5base_smoke_test.sh
 
       # 6a. On failure, dump diagnostics (service status + logs) to help debug
-      #     which of the four health signals failed and why.
+      #     which of the five health signals failed and why.
       - name: Dump stack diagnostics on failure
         if: failure()
         run: |

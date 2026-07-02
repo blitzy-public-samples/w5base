@@ -196,6 +196,21 @@ for d in "$W5CONFDIR" /var/opt/w5base "$W5STATEDIR" "$W5LOGDIR"; do
 done
 log "runtime directories ready"
 
+# W5MailSpoolDir — create the mail-spool directory that the framework default
+# (etc/w5base/default.conf: W5MailSpoolDir="/var/spool/w5mail") points at.
+# WHY: W5Server's periodic MailProc task (mod/base/W5Server/MailProc.pm, READ-
+# ONLY) probes this directory every cycle and, when it is ABSENT, logs
+# "W5MailSpoolDir '/var/spool/w5mail' does not exists" on repeat — the harmless
+# but noisy log line flagged by QA. Materializing the directory turns that probe
+# into a clean no-op: MailProc simply finds an EMPTY spool and processes zero
+# messages. This does NOT enable mail — inbound spooling is done by an external
+# MTA via sbin/W5MailSpool.sh, which this minimal base intentionally does not run
+# (mail/LDAP/Oracle are out of scope, AAP 0.6.2) — so the spool stays empty and
+# no delivery is ever attempted. Same owner/mode as the other runtime dirs so
+# the w5base service account (which W5Server drops to) can read/write it.
+install -d -m 2770 -o "$W5BASESRVUSER" -g "$W5SRVGROUP" /var/spool/w5mail
+log "mail spool directory ready (empty; silences MailProc probe, mail remains out of scope)"
+
 ########################################################################
 # 3. Render config templates -> /etc/w5base (secrets injected from env only).
 ########################################################################

@@ -323,10 +323,11 @@ whole schema through the web frontend can hit a **web-server timeout**
 (README.txt). Importantly, this run **executes the existing schema contract and
 changes no SQL** — it is the framework's own mechanism, invoked as-is.
 
-A **clean `TableVersionCheck`** (no schema errors) is **one of the four
+A **clean `TableVersionCheck`** (no schema errors) is **one of the five
 environment health signals** the smoke test verifies (alongside W5Server being
-up, the main menu rendering, and `sbin/W5InstallCheck` reporting a healthy
-install).
+up, the main menu rendering, `sbin/W5InstallCheck` reporting a healthy install,
+and a **generated menu link resolving** under `/w5base` so the menu is proven
+*navigable*, not merely rendered).
 
 ---
 
@@ -477,6 +478,25 @@ Two deliberate constraints keep this base **minimal and safe**:
   fiddly external `mod_auth_ae`/OIDC auth stack, is *why* the container keeps
   authentication minimal (Basic auth + `MASTERADMIN`). Those integrations belong
   in a separate override environment, not in this base.
+
+**Dependency and CVE posture (base images and patch tracking).** Both images are
+**pinned** for reproducibility — the application image is `debian:12`
+([`Dockerfile`](../Dockerfile)) and the database is `mariadb:10.11`
+([`docker-compose.yml`](../docker-compose.yml), never `:latest`). Their Perl,
+Apache, and MariaDB packages are the **distro-provided** versions that ship in
+those point releases; there is therefore **no application-level dependency
+manifest to bump** — the base is patched by *rebuilding on an updated upstream
+Debian/MariaDB release* (`docker compose build --pull`), not by editing a
+lockfile. Two things keep the exposure small in the meantime: the enabled Apache
+module set is deliberately narrow (**prefork, perl, proxy, rewrite, auth_basic**
+only — `http2`, `proxy_*`, `dav`, `ssl`, `md`, `ldap`, and `auth_digest` are
+*not* enabled), and Oracle/LDAP are excluded as above. Known forward-looking
+advisories against the pinned bases (for example, Apache `2.4.x` and the Perl
+`IO::Compress`/`IO::Uncompress` archive helpers) are **tracked, not reachable in
+the enabled runtime** — the narrow module set means the vulnerable code paths are
+not exercised — and are cleared by the rebuild-on-upstream-release flow above
+once fixed Debian packages are published. This is the intended maintenance model
+for a canonical dev base, not an open defect.
 
 ---
 

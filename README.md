@@ -74,10 +74,11 @@ For the full runbook (prerequisites, first login, and troubleshooting) see
 W5Base ships no unit-test framework, so environment health is asserted by a
 smoke / health-check test at
 **[tests/smoke/w5base_smoke_test.sh](tests/smoke/w5base_smoke_test.sh)**. Run it
-against the running stack; it verifies the four signals that together prove a
+against the running stack; it verifies the five signals that together prove a
 working install: **`sbin/W5Server` is up**, the **main menu returns HTTP 200** at
 `/w5base/auth/base/menu/root`, **`sbin/W5InstallCheck`** reports a healthy install,
-and **`TableVersionCheck`** completes with no schema errors.
+**`TableVersionCheck`** completes with no schema errors, and a **generated menu
+link resolves** under `/w5base` (proving the menu is *navigable*, not just rendered).
 
 ```bash
 tests/smoke/w5base_smoke_test.sh

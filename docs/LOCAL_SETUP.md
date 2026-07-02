@@ -221,14 +221,14 @@ the optional `W5BASE_ADMIN_EMAIL` in `.env`).
 ## 4. Verifying Health (Smoke Test)
 
 Because W5Base ships **no unit-test framework**, environment health is asserted
-by a smoke test that checks the four signals that together prove a working
+by a smoke test that checks the five signals that together prove a working
 install. Run it against the running stack:
 
 ```bash
 tests/smoke/w5base_smoke_test.sh
 ```
 
-The script asserts **four health signals**, and each one matters for a distinct
+The script asserts **five health signals**, and each one matters for a distinct
 reason:
 
 1. **`sbin/W5Server` is up.** The web frontend cannot function without the
@@ -249,6 +249,17 @@ reason:
 4. **`TableVersionCheck` is clean.** The schema reconciled by
    `sbin/W5Event ... -v TableVersionCheck` completes with no schema errors
    (`README.txt` L453-L459).
+5. **The menu is *navigable*, not just rendered.** Signal (2) proves the root
+   *frameset* draws, but that alone can pass while every link inside it is
+   broken. This signal fetches a **generated** menu link from the running app
+   and follows it, asserting the link carries the `/w5base` application-path
+   prefix **and** returns HTTP `200`. It exists because the kernel builds every
+   menu-tree link (and the live *user count* probe) from the `EventJobBaseUrl`
+   config value: if that value is empty the links render *without* the `/w5base`
+   segment (e.g. `/auth/base/menu/msel/...`) and every click `404`s even though
+   the root menu rendered fine. See
+   [§6 → *Menu renders but links 404*](#menu-renders-but-clicking-links-returns-404)
+   for the root cause and fix.
 
 You can reproduce signal (2) manually from your host with `curl`. Pass the admin
 credentials through a **temporary, mode-`0600` curl config file** rather than on
@@ -309,6 +320,48 @@ the Basic-auth credentials did not match the container `htpasswd` (re-check
 ## 6. Troubleshooting
 
 Each item below explains **why** the problem happens, not just the fix.
+
+### Menu renders but clicking links returns 404
+
+**Symptom:** the main menu at `/w5base/auth/base/menu/root` renders, but clicking
+a navigation entry (e.g. *Userpreferences*) lands on an Apache **`404 Not
+Found`**, and the *current user count* shows `?`. The broken links look like
+`/auth/base/menu/msel/...` — note the **missing `/w5base` prefix**.
+
+**Why:** W5Base is mounted under an **application-path segment** — here
+`/w5base` — which is both the Apache mount (`docker/apache/w5base.conf`) and the
+*config name* (the first URL segment above `auth`/`public`; see
+`README.ConfigParameters.txt`). The read-only kernel (`mod/base/menu.pm`) builds
+every menu-tree link and the live user-count probe by prepending the
+**`EventJobBaseUrl`** config value. If that value is **empty**, the kernel
+normalizes it to `/`, so links render as `/auth/base/...` — without `/w5base` —
+and Apache, which only serves the app under `/w5base/...`, returns `404`. The
+root frameset itself is requested with the correct prefix, so it renders; only
+the *generated* links are wrong.
+
+**Fix (already applied):** the application config template
+`docker/w5base/w5base.conf.tmpl` sets
+
+```ini
+EventJobBaseUrl="/w5base/"
+```
+
+so generated links carry the app path (`/w5base/auth/base/menu/msel/...`) and
+resolve. A **path-only** value (rather than a full `http://host/w5base/` URL) is
+used on purpose: it is root-relative, so it works no matter which host/port you
+reach the container on (e.g. `localhost:8080` or a forwarded port). This is a
+runtime *config* value only — no kernel/application code is changed. **Verify**
+after a rebuild:
+
+```bash
+# the rendered config carries the value...
+docker compose exec w5base grep EventJobBaseUrl /etc/w5base/w5base.conf
+# ...and a generated link resolves (smoke Check 5 asserts exactly this):
+tests/smoke/w5base_smoke_test.sh
+```
+
+If you change the app mount path, update `EventJobBaseUrl`, the Apache
+`Alias`/rewrite, and `W5APP_CONFIG` together so all three agree.
 
 ### Prefork MPM is mandatory
 
