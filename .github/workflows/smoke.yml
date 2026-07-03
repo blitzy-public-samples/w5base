@@ -1,0 +1,171 @@
+# .github/workflows/smoke.yml
+# =============================================================================
+# W5Base containerized dev-environment SMOKE TEST (Continuous Integration)
+# =============================================================================
+#
+# WHY THIS WORKFLOW EXISTS
+# ------------------------
+# This is the CI gate for the containerized W5Base local development
+# environment. On every push and pull request it proves that a newcomer can
+# bring the whole stack up with a SINGLE command and reach a working,
+# logged-in W5Base main menu. It ONLY orchestrates artifacts created elsewhere
+# in the repository (root Dockerfile, docker-compose.yml, .env.example, the
+# docker/ tree, and tests/smoke/w5base_smoke_test.sh). It is purely additive
+# and NEVER edits application logic, the Perl kernel (lib/**, mod/**), the
+# schema (sql/**), or existing config (etc/**). If any step appeared to require
+# editing application code, the correct action is to STOP and FLAG instead.
+#
+# HOW IT WORKS (and WHY each step exists)
+#   1. Checkout the repo (pinned action -> reproducibility, mirrors the AAP's
+#      image-tag-pinning discipline).
+#   2. Generate a runtime .env from the committed .env.example, injecting
+#      CI-ONLY PLACEHOLDER secrets. Never real credentials, and never the
+#      legacy default credentials documented in README.txt. The Compose stack
+#      (via env_file) and the smoke test both consume this .env.
+#   3. `docker compose up --build -d` builds the Debian + Apache-prefork +
+#      mod_perl2 image and starts it alongside the MySQL `db` service. The app
+#      service is health-gated on the db (depends_on: condition:
+#      service_healthy), so Compose already sequences DB-ready -> app startup;
+#      we do NOT rely on plain depends_on for readiness.
+#   4. A light, bounded readiness wait. Intentionally light because the smoke
+#      test itself retries the HTTP main-menu check ~10x; this only gives the
+#      entrypoint a head start and surfaces an early hard failure.
+#   5. Run the mandatory smoke test. It is the gate: it asserts the FIVE health
+#      signals against the running stack and a non-zero exit fails the job.
+#        (1) W5Server (persistent TCP control plane) is up -- a running Apache
+#            alone is insufficient because the Apache spare processes talk to
+#            W5Server over TCP for all async/atomic operations.
+#        (2) The main menu renders: HTTP 200 at
+#            ${W5BASE_BASE_URL}/w5base/auth/base/menu/root (the primary,
+#            user-visible acceptance signal), via HTTP Basic auth.
+#        (3) sbin/W5InstallCheck reports a healthy install (exit 0).
+#        (4) TableVersionCheck reconciles the schema cleanly (exit 0).
+#        (5) The menu is NAVIGABLE: a generated menu link carries the /w5base
+#            app-path prefix AND resolves (HTTP 200). Guards the menu-404 class
+#            of defect where the root frameset renders but every link is broken.
+#      Exit 1 = a health signal failed; exit 2 = missing config.
+#   6. Always tear the stack down (docker compose down -v) so the runner stays
+#      clean; on failure, dump logs/ps to aid debugging.
+# =============================================================================
+
+name: W5Base Smoke Test
+
+# Run on pushes and PRs so the containerized environment is continuously validated.
+on: [push, pull_request]
+
+jobs:
+  smoke:
+    name: Build stack and run smoke test
+    runs-on: ubuntu-latest   # GitHub-hosted runner ships Docker Engine + Compose v2
+
+    # CI-only credentials. Prefer configured GitHub Actions Secrets; fall back to
+    # non-production PLACEHOLDERS so the job is self-contained. These are NEVER
+    # real secrets and NEVER the legacy default credentials from README.txt (AAP 0.7).
+    # W5BASE_ADMIN / W5BASE_ADMIN_PASSWORD / W5BASE_BASE_URL are exported at the
+    # job level so they are also directly visible to the smoke-test step (the
+    # script EXITS 2 if the admin credentials are unset).
+    env:
+      W5BASE_ADMIN: ${{ secrets.W5BASE_ADMIN || 'ci/admin' }}
+      W5BASE_ADMIN_PASSWORD: ${{ secrets.W5BASE_ADMIN_PASSWORD || 'ci-not-a-real-password' }}
+      W5BASE_DB_PASSWORD: ${{ secrets.W5BASE_DB_PASSWORD || 'ci-not-a-real-db-password' }}
+      MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD || 'ci-not-a-real-root-password' }}
+      W5BASE_BASE_URL: http://localhost:8080
+
+    steps:
+      # 1. Check out the repository. This brings in the root Dockerfile,
+      #    docker-compose.yml, .env.example, the docker/ tree, and
+      #    tests/smoke/w5base_smoke_test.sh. Pinned to a released major version
+      #    for reproducibility (mirrors the AAP image-tag-pinning discipline).
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1b. Fast, dependency-free regression check of the smoke test's own
+      #     W5ServerPort parser BEFORE building the stack. This runs
+      #     `w5base_smoke_test.sh --self-test`, which needs neither Docker nor
+      #     any secret, and asserts that host:port config values (e.g.
+      #     "127.0.0.1:12833") resolve to the correct port. It fails the job
+      #     immediately if the parser regresses, so a broken parser can never
+      #     silently false-fail (or false-pass) the health gate below.
+      - name: Smoke-test parser self-test (no Docker required)
+        run: |
+          chmod +x ./tests/smoke/w5base_smoke_test.sh
+          ./tests/smoke/w5base_smoke_test.sh --self-test
+
+      # 2. Provision the runtime .env from the committed template, then override
+      #    the secret & coordination values with CI placeholders (dotenv
+      #    last-wins semantics, which docker compose env_file and the smoke
+      #    test's `. .env` both honor). .env is generated on the runner and is
+      #    NEVER committed. MYSQL_PASSWORD MUST equal W5BASE_DB_PASSWORD (they
+      #    are the same application DB user password). W5BASE_DSN points at the
+      #    Compose service name `db`, not localhost.
+      - name: Provision .env (CI placeholders only -- no real secrets)
+        run: |
+          cp .env.example .env
+          {
+            echo "W5BASE_ADMIN=${W5BASE_ADMIN}"
+            echo "W5BASE_ADMIN_PASSWORD=${W5BASE_ADMIN_PASSWORD}"
+            echo "W5BASE_DB_PASSWORD=${W5BASE_DB_PASSWORD}"
+            echo "MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}"
+            echo "MYSQL_PASSWORD=${W5BASE_DB_PASSWORD}"
+            echo "MYSQL_DATABASE=w5base"
+            echo "MYSQL_USER=w5base"
+            echo "W5BASE_BASE_URL=${W5BASE_BASE_URL}"
+            # Quote the DSN: its ';' separators are shell metacharacters, so the
+            # value must survive both docker compose env_file parsing (quotes
+            # stripped) and the smoke test's `. .env` shell-sourcing (quotes
+            # protect the semicolons). Host is the compose service name `db`.
+            echo 'W5BASE_DSN="dbi:mysql:database=w5base;host=db;port=3306"'
+          } >> .env
+
+      # 3. Build and start the full stack in the background. This is the exact
+      #    recipe the smoke test's own "In CI" section prescribes. The app
+      #    service `w5base` is health-gated on the `db` service, so Compose
+      #    sequences DB-ready -> app startup.
+      - name: Build and start the Compose stack
+        run: docker compose up --build -d
+
+      # 4. Light, bounded readiness wait: poll until the `db` service reports
+      #    healthy (or the bound elapses). The smoke test retries the HTTP check
+      #    itself, so this stays light; it mainly surfaces an early failure and
+      #    prints stack status for the logs.
+      - name: Wait for services to settle
+        run: |
+          echo "Waiting for the db service to report healthy..."
+          for i in $(seq 1 30); do
+            cid="$(docker compose ps -q db 2>/dev/null || true)"
+            status="none"
+            if [ -n "$cid" ]; then
+              status="$(docker inspect --format '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}no-healthcheck{{ end }}' "$cid" 2>/dev/null || echo unknown)"
+            fi
+            echo "  attempt $i/30: db health=${status}"
+            if [ "$status" = "healthy" ] || [ "$status" = "no-healthcheck" ]; then
+              break
+            fi
+            sleep 5
+          done
+          docker compose ps
+
+      # 5. Run the mandatory smoke test from the repo root. It is env-driven and
+      #    auto-loads .env; the admin creds + base URL are also exported via the
+      #    job env (see above) so the required variables are always visible.
+      #    From the host it drives the app container via
+      #    `docker compose exec -T w5base ...` (the -T flag is required for
+      #    non-interactive CI). A non-zero exit fails the job automatically.
+      - name: Run W5Base smoke test (asserts the five health signals)
+        run: |
+          chmod +x ./tests/smoke/w5base_smoke_test.sh
+          ./tests/smoke/w5base_smoke_test.sh
+
+      # 6a. On failure, dump diagnostics (service status + logs) to help debug
+      #     which of the five health signals failed and why.
+      - name: Dump stack diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps || true
+          docker compose logs --no-color || true
+
+      # 6b. Always tear the stack down and free volumes so the runner is clean,
+      #     regardless of whether the smoke test passed or failed.
+      - name: Tear down the stack
+        if: always()
+        run: docker compose down -v

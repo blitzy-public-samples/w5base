@@ -1,0 +1,76 @@
+#
+# w5base.conf.tmpl — W5Base application config (TEMPLATE)
+#
+# Rendered by docker/entrypoint.sh (whitelist envsubst) into
+# /etc/w5base/w5base.conf (owner w5base:daemon, mode 0640), then read by the
+# web/app path (bin/app.pl under Apache prefork + mod_perl2) and by the
+# non-interactive schema build (sbin/W5Event -c w5base -s -d -v TableVersionCheck).
+#
+# WHAT is substituted from the environment at render time:
+#   - W5BASE_ADMIN           the admin REMOTE_USER (see MASTERADMIN below)
+#   - W5BASE_OPERATION_MODE  the application operation mode
+# These are the ONLY environment tokens in this template, and both are defined
+# in .env.example. SITENAME, AutoLoadMenuPath and EventJobBaseUrl are written as
+# LITERALS on purpose: they are NOT provided in .env, so leaving them as
+# placeholders would render EMPTY and break the app identity / landing menu /
+# menu-link generation. Their literal values mirror the framework reference
+# etc/w5base/default.conf.
+#
+# WHY the INCLUDE: the data-object DB credentials are never hardcoded here.
+# They live in the shared databases.conf fragment (rendered from
+# docker/w5base/databases.conf.tmpl) and are pulled in via the INCLUDE below —
+# the same convention W5Server uses, so the control plane and the web/app path
+# share one DB definition (README.txt L244; README.ConfigParameters.txt L69).
+#
+# WHY MASTERADMIN matters: the kernel grants the built-in admin group whenever
+# the authenticated REMOTE_USER equals MASTERADMIN, regardless of group
+# membership (README.ConfigParameters.txt L82-86). Keeping MASTERADMIN equal to
+# the htpasswd admin username is what lets first login reach the main menu at
+# /w5base/auth/base/menu/root. The legacy documented default must be changed.
+#
+# Framework defaults inherited from etc/w5base/default.conf are intentionally
+# not restated here; only the non-default keys plus the INCLUDE are set.
+#
+INCLUDE /etc/w5base/databases.conf
+MASTERADMIN="${W5BASE_ADMIN}"
+SITENAME="W5Base"
+AutoLoadMenuPath="MyW5Base"
+W5BaseOperationMode="${W5BASE_OPERATION_MODE}"
+
+#
+# EventJobBaseUrl — the base URL W5Base prepends when it generates ABSOLUTE,
+# root-relative in-app links (WHAT).
+#
+# WHY this key is mandatory here (root cause of the QA "menu 404" defect):
+# the READ-ONLY kernel builds the left-hand navigation tree and the live
+# "current user count" JSONP probe from this value. In mod/base/menu.pm the
+# menu-tree href base is assembled as
+#       EventJobBaseUrl [+ "auth/"] + "base/menu/"            (_getMenuEntryFinalList)
+# and the user-count endpoint as
+#       EventJobBaseUrl + "auth/base/userlogon/userCount"     (menuframe)
+# W5Base is mounted under an APP-NAME path segment (here "/w5base/", the config
+# name = the first URL segment above auth|public — see README.ConfigParameters
+# and the Apache Alias/rewrite in docker/apache/w5base.conf). When
+# EventJobBaseUrl is EMPTY the kernel normalizes it to "/", so those links
+# render as "/auth/base/menu/msel/..." and "/auth/base/userlogon/userCount" —
+# WITHOUT the "/w5base" prefix — and every click / probe hits Apache as a path
+# that has no Alias and no matching rewrite, returning 404. Setting this key so
+# the generated links carry the app path is exactly the framework's documented
+# expectation: etc/w5base/default.conf notes EventJobBaseUrl "should in most
+# cases [be] set to https://hostname/config".
+#
+# HOW / WHY the value is "/w5base/" (a PATH, not a full URL): the containerized
+# dev environment is reached over a mapped port and, depending on the client,
+# via localhost:8080, 127.0.0.1, a forwarded port, or the Docker host IP. A
+# PATH-only, root-relative base is host- and port-AGNOSTIC — the browser
+# resolves "/w5base/auth/..." against whatever origin actually served the page,
+# so navigation works from ANY of those access paths (a full
+# "http://localhost:8080/w5base/" value would hard-code the host and break when
+# reached through a different host/port). "/w5base/" matches the Apache mount
+# (docker/apache/w5base.conf), the config name (W5APP_CONFIG=w5base in
+# docker/entrypoint.sh) and this file's own name (w5base.conf). A production
+# deployment with a stable public hostname may instead set the full
+# "https://host/w5base/" form. This is a runtime CONFIG value only; no kernel /
+# application code is changed (Preserve Backward Compatibility).
+#
+EventJobBaseUrl="/w5base/"
